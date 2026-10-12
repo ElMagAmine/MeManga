@@ -1332,3 +1332,86 @@ class TestInvalidConfigFile:
         assert "cannot load config file" in err
         assert "memanga doctor" in err
         assert path.read_text(encoding="utf-8") == self.BROKEN
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Issue #375 — bracketed data must render literally, not as Rich markup
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestRichMarkupEscaping:
+    CLOSING = "Mushoku Tensei [/Official]"  # unmatched close tag → MarkupError
+    STYLED = "Re:Zero [bold]"               # valid style tag → text vanished
+
+    @pytest.fixture(autouse=True)
+    def wide_console(self, monkeypatch):
+        # Wide enough that table cells don't wrap the asserted strings.
+        from rich.console import Console
+        from memanga import cli
+        monkeypatch.setattr(cli, "console", Console(width=250))
+
+    def _seed(self, config, *entries):
+        config.set("manga", [
+            {"title": title, "source": "mangadex.org",
+             "url": f"https://mangadex.org/t/{i}", "status": status}
+            for i, (title, status) in enumerate(entries)
+        ])
+        config.save()
+
+    def test_list_renders_bracketed_titles(self, run_cli, config, capsys):
+        self._seed(config, (self.CLOSING, "reading"), (self.STYLED, "on-hold"))
+        capsys.readouterr()
+
+        assert run_cli("list") == 0
+        out = capsys.readouterr().out
+        assert self.CLOSING in out
+        assert self.STYLED in out
+        assert "on-hold" in out
+
+    def test_check_dry_run_renders_titles_status_and_chapter_titles(
+            self, run_cli, config, monkeypatch, capsys):
+        from memanga import cli
+        from memanga.scrapers.base import Chapter
+
+        self._seed(config, (self.CLOSING, "reading"), (self.STYLED, "on-hold"))
+        monkeypatch.setattr(cli, "check_for_updates", lambda *a, **k: [
+            Chapter(number="5", title="[/Extra] Side [bold]Story"),
+        ])
+        capsys.readouterr()
+
+        assert run_cli("check", "--dry-run") == 0
+        out = capsys.readouterr().out
+        assert f"Checking: {self.CLOSING}..." in out
+        assert f"Skipping: {self.STYLED} [on-hold]" in out
+        assert "[DRY RUN] Chapter 5: [/Extra] Side [bold]Story" in out
+
+    def test_check_renders_exception_text(self, run_cli, config, monkeypatch,
+                                          capsys):
+        from memanga import cli
+        from memanga.downloader import DownloaderError
+
+        self._seed(config, (self.CLOSING, "reading"))
+
+        def _boom(*a, **k):
+            raise DownloaderError("HTTP 403 [/forbidden] at [red]edge")
+
+        monkeypatch.setattr(cli, "check_for_updates", _boom)
+        capsys.readouterr()
+
+        assert run_cli("check", "--dry-run") == 0
+        out = capsys.readouterr().out
+        assert "Error: HTTP 403 [/forbidden] at [red]edge" in out
+
+    def test_failed_renders_bracketed_title_and_error(self, run_cli, config,
+                                                     cli_state, capsys):
+        self._seed(config, (self.CLOSING, "reading"))
+        cli_state.add_failed_chapter(
+            self.CLOSING, "12", "mangadex.org", "Timeout [/retry] [bold]x",
+        )
+        cli_state.save()
+        capsys.readouterr()
+
+        assert run_cli("failed") == 0
+        out = capsys.readouterr().out
+        assert self.CLOSING in out
+        assert "Timeout [/retry] [bold]x" in out
