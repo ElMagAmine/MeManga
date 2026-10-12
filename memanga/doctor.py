@@ -445,18 +445,46 @@ def _find_interpreter(tokens: List[str]) -> Optional[str]:
     return None
 
 
+def _runs_check(tokens: List[str]) -> bool:
+    """True when the tokens run ``-m memanga [--config-dir DIR] check``,
+    looking inside wrapper strings like :func:`_find_interpreter`."""
+    for i, token in enumerate(tokens):
+        if token == "-m" and tokens[i + 1:i + 2] == ["memanga"]:
+            j = i + 2
+            # `cron install` pins a non-default config root (issue #221).
+            while j < len(tokens):
+                if tokens[j] == "--config-dir":
+                    j += 2
+                elif tokens[j].startswith("--config-dir="):
+                    j += 1
+                else:
+                    break
+            if tokens[j:j + 1] == ["check"]:
+                return True
+        elif " -m memanga" in token:
+            try:
+                if _runs_check(shlex.split(token)):
+                    return True
+            except ValueError:
+                pass
+    return False
+
+
 def _cron_entry_sane(line: str) -> bool:
     """Loose sanity check for a MeManga crontab line: five schedule fields,
-    a `memanga check` command and, when the interpreter can be located,
-    an interpreter path that still exists. Hand-written wrappers (flock,
-    bash -lc) are accepted."""
+    a `memanga check` command (optionally after `--config-dir DIR`) and,
+    when the interpreter can be located, an interpreter path that still
+    exists. Hand-written wrappers (flock, bash -lc) are accepted."""
     fields = line.split(None, 5)
-    if len(fields) < 6 or "memanga check" not in fields[5]:
+    if len(fields) < 6:
         return False
     try:
-        interpreter = _find_interpreter(shlex.split(fields[5]))
+        tokens = shlex.split(fields[5])
     except ValueError:
         return False
+    if "memanga check" not in fields[5] and not _runs_check(tokens):
+        return False
+    interpreter = _find_interpreter(tokens)
     if interpreter and os.sep in interpreter:
         return Path(interpreter).exists()
     return True

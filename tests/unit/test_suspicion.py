@@ -517,15 +517,14 @@ class TestStateSuspiciousBatch:
 class TestCliForceSuspicious:
     @pytest.fixture
     def cli(self, isolated_home, monkeypatch):
-        """memanga.cli with its module-level config/state rebound to the
-        isolated home (they are built at import time)."""
+        """memanga.cli bound to a context in the isolated home, as main()
+        would after parsing `--config-dir`. monkeypatch restores the
+        module globals afterwards."""
         from memanga import cli as cli_mod
-        from memanga.config import Config
-        from memanga.state import State
-        monkeypatch.setattr(cli_mod, "config", Config())
-        monkeypatch.setattr(
-            cli_mod, "state",
-            State(config_dir=isolated_home / ".config" / "memanga"),
+        for name in ("_context", "config", "state"):
+            monkeypatch.setattr(cli_mod, name, getattr(cli_mod, name))
+        cli_mod.use_context(
+            cli_mod.build_context(isolated_home / ".config" / "memanga")
         )
         return cli_mod
 

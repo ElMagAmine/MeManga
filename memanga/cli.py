@@ -11,8 +11,9 @@ import platform
 import sys
 import subprocess
 from pathlib import Path
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -35,10 +36,57 @@ from .search import compute_search_sources, probe_chapter_counts, sweep
 from .emailer import send_to_kindle, EmailError
 
 console = Console()
-# Tolerant so a broken config.yaml can't crash the import before
-# `doctor` runs; main() refuses every other command (issue #250).
-config = Config(tolerate_errors=True)
-state = State()
+
+# Issue #221: `--config-dir DIR` wins over $MEMANGA_CONFIG_DIR, which
+# wins over the default ~/.config/memanga.
+CONFIG_DIR_ENV = "MEMANGA_CONFIG_DIR"
+
+
+@dataclass
+class CliContext:
+    """Config and State for one CLI run, rooted in the same directory."""
+    config: Config
+    state: State
+    # Explicitly selected root, or None for the default location.
+    config_dir: Optional[Path] = None
+
+
+# Context of the running command. Bound by use_context() once main()
+# has parsed the arguments, never at import: building Config/State
+# creates the config directory.
+_context: Optional[CliContext] = None
+config: Optional[Config] = None
+state: Optional[State] = None
+
+
+def resolve_config_dir(cli_value=None) -> Optional[Path]:
+    """Return the selected config root, or None for the default."""
+    value = cli_value or os.environ.get(CONFIG_DIR_ENV)
+    if not value:
+        return None
+    return Path(value).expanduser().absolute()
+
+
+def build_context(config_dir=None) -> CliContext:
+    """Build Config and State under ``config_dir`` (None = default).
+
+    Config is tolerant so a broken config.yaml still reaches `doctor`;
+    main() refuses every other command (issue #250).
+    """
+    return CliContext(
+        config=Config(config_dir, tolerate_errors=True),
+        state=State(config_dir),
+        config_dir=config_dir,
+    )
+
+
+def use_context(ctx: CliContext) -> CliContext:
+    """Make ``ctx`` the Config/State the command handlers operate on."""
+    global _context, config, state
+    _context = ctx
+    config, state = ctx.config, ctx.state
+    return ctx
+
 
 # ============================================================================
 # CLI Commands
@@ -1098,7 +1146,8 @@ def _cmd_cron_unix(args):
             console.print("[red]Invalid time format. Use HH:MM[/red]")
             return 1
 
-        cron_line = build_cron_line(minute, hour, project_dir, python_path)
+        cron_line = build_cron_line(minute, hour, project_dir, python_path,
+                                    config_dir=_context.config_dir)
 
         result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
         existing = result.stdout if result.returncode == 0 else ""
@@ -1192,7 +1241,10 @@ def _cmd_cron_windows(args):
             capture_output=True, text=True,
         )
 
-        cmd = f'"{python_path}" -m memanga check --auto --quiet'
+        cmd = f'"{python_path}" -m memanga'
+        if _context.config_dir is not None:
+            cmd += f' --config-dir "{_context.config_dir}"'
+        cmd += " check --auto --quiet"
         result = subprocess.run(
             [
                 "schtasks", "/create",
@@ -1957,6 +2009,7 @@ Examples:
   memanga doctor                        # Diagnose setup problems
   memanga cron install                  # Set up daily checks
   memanga config                        # Configure settings
+  memanga --config-dir DIR status       # Use another config directory
 """
     if not _cli_only:
         _epilog += "  memanga --gui                         # Launch graphical interface\n"
@@ -1965,6 +2018,11 @@ Examples:
         description="📖 MeManga - Automatic manga downloader",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_epilog,
+    )
+    parser.add_argument(
+        "--config-dir", metavar="DIR",
+        help=f"Use DIR for config.yaml and state.json (default: ${CONFIG_DIR_ENV} "
+             "or ~/.config/memanga). Goes before the command.",
     )
     # In CLI-only Docker images (MEMANGA_CLI_ONLY=1) the GUI is not installed;
     # suppress the flag from help and reject it at runtime with a clear message.
@@ -2120,6 +2178,13 @@ Examples:
     # retry/clear progress output into machine-readable stdout.
     if args.command == "failed" and args.json and (args.retry or args.clear):
         p_failed.error("--json cannot be combined with --retry or --clear")
+
+    # The GUI builds its own Config/State under the default root.
+    if args.gui and args.config_dir:
+        parser.error("--config-dir is not supported with --gui")
+    use_context(build_context(
+        None if args.gui else resolve_config_dir(args.config_dir)
+    ))
 
     # Only doctor may run on fallback defaults; anything else could act
     # on an empty manga list or overwrite the user's broken config.

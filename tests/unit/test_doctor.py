@@ -335,6 +335,26 @@ class TestScheduler:
                 f"'cd /opt/memanga && {sys.executable} -m memanga check --auto --quiet'")
         assert self._check(config, line).status == doctor.OK
 
+    def test_config_dir_entry_is_accepted(self, config):
+        """#221: `cron install` under --config-dir puts the option before
+        the `check` command."""
+        from memanga.cron import build_cron_line
+        config.set("cron.enabled", True)
+        line = build_cron_line(0, 6, "/opt/memanga", sys.executable,
+                               config_dir="/srv/My Manga/cfg")
+        assert self._check(config, line + "\n").status == doctor.OK
+
+    def test_config_dir_equals_form_is_accepted(self, config):
+        config.set("cron.enabled", True)
+        line = (f"0 6 * * * {sys.executable} -m memanga "
+                f"--config-dir=/srv/cfg check --auto --quiet")
+        assert self._check(config, line).status == doctor.OK
+
+    def test_config_dir_without_check_warns(self, config):
+        config.set("cron.enabled", True)
+        line = f"0 6 * * * {sys.executable} -m memanga --config-dir /srv/cfg status"
+        assert self._check(config, line).status == doctor.WARNING
+
     def test_crontab_unavailable(self, config):
         def missing(*a, **k):
             raise FileNotFoundError("crontab")

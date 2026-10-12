@@ -17,13 +17,20 @@ def quote_cron_path(path) -> str:
     return shlex.quote(str(path)).replace("%", r"\%")
 
 
-def build_cron_line(minute, hour, project_dir, python_path) -> str:
-    """Build the daily auto-check crontab entry with shell-safe paths."""
+def build_cron_line(minute, hour, project_dir, python_path, config_dir=None) -> str:
+    """Build the daily auto-check crontab entry with shell-safe paths.
+
+    ``config_dir`` pins the scheduled run to a non-default config root
+    (issue #221); None keeps the default location.
+    """
     project_dir = PurePosixPath(Path(project_dir).as_posix())
     python_path = Path(python_path).as_posix()
+    memanga = f"{quote_cron_path(python_path)} -m memanga"
+    if config_dir is not None:
+        memanga += f" --config-dir {quote_cron_path(Path(config_dir).as_posix())}"
     command = (
         f"cd {quote_cron_path(project_dir)} && "
-        f"{quote_cron_path(python_path)} -m memanga check --auto --quiet"
+        f"{memanga} check --auto --quiet"
     )
     log_path = quote_cron_path(project_dir / "memanga.log")
     return f"{minute} {hour} * * * {command} >> {log_path} 2>&1"
