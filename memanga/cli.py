@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm
 from rich.table import Table
@@ -36,6 +37,12 @@ from .search import compute_search_sources, probe_chapter_counts, sweep
 from .emailer import send_to_kindle, EmailError
 
 console = Console()
+
+
+def _esc(value) -> str:
+    """Escape data (titles, statuses, paths, errors) for interpolation
+    into Rich markup so brackets render literally (issue #375)."""
+    return escape(str(value))
 
 # Issue #221: `--config-dir DIR` wins over $MEMANGA_CONFIG_DIR, which
 # wins over the default ~/.config/memanga.
@@ -134,7 +141,7 @@ def _get_status_display(manga: Dict[str, Any]) -> str:
         "dropped": "red",
         "completed": "cyan",
     }
-    return f"[{colors.get(status, 'white')}]{status}[/]"
+    return f"[{colors.get(status, 'white')}]{_esc(status)}[/]"
 
 
 def _get_sources_display(manga: Dict[str, Any]) -> str:
@@ -214,9 +221,9 @@ def cmd_list(args):
         
         table.add_row(
             str(i),
-            title,
+            _esc(title),
             _get_status_display(manga),
-            _get_sources_display(manga),
+            _esc(_get_sources_display(manga)),
             str(last_ch) if last_ch else "—",
             str(len(downloaded)) if downloaded else "0",
         )
@@ -236,7 +243,7 @@ def cmd_add(args):
         console.print("\n[bold green]➕ Add New Manga[/bold green]\n")
         
         sources = get_supported_sources()
-        console.print(f"[dim]Supported sources:[/dim] {', '.join(sources)}\n")
+        console.print(f"[dim]Supported sources:[/dim] {_esc(', '.join(sources))}\n")
         
         title = Prompt.ask("📖 Manga title")
         if not title:
@@ -273,8 +280,8 @@ def cmd_add(args):
     supported = get_supported_sources()
     source_ok = any(source == s or source.endswith("." + s) for s in supported)
     if not source_ok:
-        console.print(f"[yellow]⚠️  Warning:[/yellow] '{source}' might not be supported.")
-        console.print(f"[dim]Supported: {', '.join(supported)}[/dim]")
+        console.print(f"[yellow]⚠️  Warning:[/yellow] '{_esc(source)}' might not be supported.")
+        console.print(f"[dim]Supported: {_esc(', '.join(supported))}[/dim]")
         if not Confirm.ask("Add anyway?"):
             return
     
@@ -312,7 +319,7 @@ def cmd_add(args):
     # Check for exact duplicate
     for m in manga_list:
         if m["title"].lower() == title.lower():
-            console.print(f"[yellow]⚠️  '{title}' already exists![/yellow]")
+            console.print(f"[yellow]⚠️  '{_esc(title)}' already exists![/yellow]")
             return
 
     # Check for similar titles (substring match)
@@ -320,7 +327,7 @@ def cmd_add(args):
     for m in manga_list:
         existing_lower = m["title"].lower()
         if (new_lower in existing_lower or existing_lower in new_lower) and new_lower != existing_lower:
-            console.print(f"[yellow]⚠️  Similar manga already tracked: [cyan]{m['title']}[/cyan][/yellow]")
+            console.print(f"[yellow]⚠️  Similar manga already tracked: [cyan]{_esc(m['title'])}[/cyan][/yellow]")
             if not Confirm.ask("Add anyway?", default=False):
                 return
             break
@@ -331,11 +338,11 @@ def cmd_add(args):
     
     if backup_url:
         backup_source = urlparse(backup_url).netloc.replace("www.", "")
-        console.print(f"\n[green]✅ Added:[/green] {title}")
-        console.print(f"   [dim]Primary:[/dim] {source}")
-        console.print(f"   [dim]Backup:[/dim] {backup_source} (after {fallback_days} days)")
+        console.print(f"\n[green]✅ Added:[/green] {_esc(title)}")
+        console.print(f"   [dim]Primary:[/dim] {_esc(source)}")
+        console.print(f"   [dim]Backup:[/dim] {_esc(backup_source)} (after {fallback_days} days)")
     else:
-        console.print(f"\n[green]✅ Added:[/green] {title} ({source})")
+        console.print(f"\n[green]✅ Added:[/green] {_esc(title)} ({_esc(source)})")
 
 
 def _find_manga(target: str, manga_list: list):
@@ -362,11 +369,11 @@ def cmd_remove(args):
     found, found_idx = _find_manga(args.target, manga_list)
 
     if not found:
-        console.print(f"[red]Not found:[/red] {args.target}")
+        console.print(f"[red]Not found:[/red] {_esc(args.target)}")
         console.print("[dim]Use 'memanga list' to see tracked manga.[/dim]")
         return
 
-    if args.yes or Confirm.ask(f"Remove [cyan]{found['title']}[/cyan]?"):
+    if args.yes or Confirm.ask(f"Remove [cyan]{_esc(found['title'])}[/cyan]?"):
         manga_list.pop(found_idx)
         config.set("manga", manga_list)
         config.save()
@@ -378,7 +385,7 @@ def cmd_remove(args):
                 del manga_state[found["title"]]
                 state.set("manga", manga_state)
         
-        console.print(f"[red]🗑️  Removed:[/red] {found['title']}")
+        console.print(f"[red]🗑️  Removed:[/red] {_esc(found['title'])}")
 
 
 def cmd_set_status(args):
@@ -392,14 +399,14 @@ def cmd_set_status(args):
     new_status = args.status.lower()
 
     if new_status not in VALID_STATUSES:
-        console.print(f"[red]Invalid status:[/red] {new_status}")
+        console.print(f"[red]Invalid status:[/red] {_esc(new_status)}")
         console.print(f"[dim]Valid: {', '.join(VALID_STATUSES)}[/dim]")
         return
 
     found, found_idx = _find_manga(args.target, manga_list)
 
     if not found:
-        console.print(f"[red]Not found:[/red] {args.target}")
+        console.print(f"[red]Not found:[/red] {_esc(args.target)}")
         return
 
     old_status = found.get("status", "reading")
@@ -412,7 +419,10 @@ def cmd_set_status(args):
     old_color = colors.get(old_status, "white")
     new_color = colors.get(new_status, "white")
     
-    console.print(f"[cyan]{found['title']}[/cyan]: [{old_color}]{old_status}[/] → [{new_color}]{new_status}[/]")
+    console.print(
+        f"[cyan]{_esc(found['title'])}[/cyan]: "
+        f"[{old_color}]{_esc(old_status)}[/] → [{new_color}]{_esc(new_status)}[/]"
+    )
 
 
 def cmd_update(args):
@@ -428,7 +438,7 @@ def cmd_update(args):
     found, found_idx = _find_manga(args.target, manga_list)
 
     if not found:
-        console.print(f"[red]Not found:[/red] {args.target}")
+        console.print(f"[red]Not found:[/red] {_esc(args.target)}")
         console.print("[dim]Use 'memanga list' to see tracked manga.[/dim]")
         return
 
@@ -489,9 +499,9 @@ def cmd_update(args):
     config.set("manga", manga_list)
     config.save()
 
-    console.print(f"[green]Updated [cyan]{old_title}[/cyan]:[/green]")
+    console.print(f"[green]Updated [cyan]{_esc(old_title)}[/cyan]:[/green]")
     for c in changes:
-        console.print(f"  {c}")
+        console.print(f"  {_esc(c)}")
 
 
 def cmd_check(args):
@@ -506,7 +516,7 @@ def cmd_check(args):
     if args.title:
         manga_list = [m for m in manga_list if args.title.lower() in m["title"].lower()]
         if not manga_list:
-            console.print(f"[red]Not found:[/red] {args.title}")
+            console.print(f"[red]Not found:[/red] {_esc(args.title)}")
             return
     
     from_chapter = getattr(args, 'from_chapter', None)
@@ -553,10 +563,10 @@ def cmd_check(args):
         
         # Skip non-reading manga unless explicitly specified by title
         if status != "reading" and not args.title:
-            console.print(f"[dim]Skipping:[/dim] [cyan]{title}[/cyan] [{status}]")
+            console.print(f"[dim]Skipping:[/dim] [cyan]{_esc(title)}[/cyan] {_esc(f'[{status}]')}")
             continue
         
-        console.print(f"[dim]Checking:[/dim] [cyan]{title}[/cyan]...")
+        console.print(f"[dim]Checking:[/dim] [cyan]{_esc(title)}[/cyan]...")
         
         try:
             force_suspicious = getattr(args, 'force_suspicious', False)
@@ -572,13 +582,13 @@ def cmd_check(args):
             if suspicious:
                 console.print(
                     f"  [yellow]└─ Warning: Suspicious chapter batch detected: "
-                    f"{suspicious.get('count')} chapter(s) up to "
-                    f"{suspicious.get('highest')} "
-                    f"(last tracked: {suspicious.get('last_chapter')})[/yellow]"
+                    f"{_esc(suspicious.get('count'))} chapter(s) up to "
+                    f"{_esc(suspicious.get('highest'))} "
+                    f"(last tracked: {_esc(suspicious.get('last_chapter'))})[/yellow]"
                 )
                 for reason in suspicious.get("reasons", []):
-                    console.print(f"     [dim]- {reason}[/dim]")
-                console.print(f"     [dim]- {suspicious.get('backup_status')}[/dim]")
+                    console.print(f"     [dim]- {_esc(reason)}[/dim]")
+                console.print(f"     [dim]- {_esc(suspicious.get('backup_status'))}[/dim]")
                 console.print(
                     "     [yellow]Skipped auto-delivery. Run "
                     "'memanga check --force-suspicious' to accept anyway.[/yellow]"
@@ -596,12 +606,14 @@ def cmd_check(args):
                 ch_label = f"Chapter {ch.number}"
                 if ch.title:
                     ch_label += f": {ch.title}"
+                # Chapter titles are scraped data; escape before markup use.
+                ch_label = _esc(ch_label)
 
                 # Dry run: just list chapters
                 if dry_run:
                     source_info = ""
                     if isinstance(ch, ChapterWithSource) and ch.is_backup:
-                        source_info = f" [yellow](backup: {ch.source})[/yellow]"
+                        source_info = f" [yellow](backup: {_esc(ch.source)})[/yellow]"
                     console.print(f"     [dim][DRY RUN][/dim] {ch_label}{source_info}")
                     total_downloaded += 1
                     continue
@@ -647,19 +659,19 @@ def cmd_check(args):
                             file_path.unlink()
                             console.print("     [dim]🗑️  Deleted local copy[/dim]")
                     except EmailError as email_e:
-                        console.print(f"     [red]📧 Email failed: {email_e}[/red]")
+                        console.print(f"     [red]📧 Email failed: {_esc(email_e)}[/red]")
 
                 def _announce_saved(file_path, from_backup, partial, source=None):
                     """Print the save line and, for partials, warn + log which
                     pages are missing so headless runs leave a trail."""
-                    label = f"{file_path.parent.name}/{file_path.name}/" if file_path.is_dir() else file_path.name
+                    label = _esc(f"{file_path.parent.name}/{file_path.name}/" if file_path.is_dir() else file_path.name)
                     src = " from backup" if from_backup else ""
                     if partial:
                         miss = partial.get("failed_pages", [])
                         total = partial.get("total", 0)
                         console.print(
                             f"     [yellow]⚠️  Saved partial{src}: {label} — "
-                            f"{len(miss)}/{total} page(s) missing (pages {miss})[/yellow]"
+                            f"{len(miss)}/{total} page(s) missing (pages {_esc(miss)})[/yellow]"
                         )
                         state.add_notification(
                             "warn",
@@ -683,7 +695,7 @@ def cmd_check(args):
                     # Show source info if from backup
                     source_info = ""
                     if isinstance(ch, ChapterWithSource) and ch.is_backup:
-                        source_info = f" [yellow](from backup: {ch.source})[/yellow]"
+                        source_info = f" [yellow](from backup: {_esc(ch.source)})[/yellow]"
 
                     console.print(f"     [dim]⬇️  Downloading {ch_label}...{source_info}[/dim]")
 
@@ -735,7 +747,7 @@ def cmd_check(args):
 
                     # 1) Try a complete download from the backup source.
                     if backup_ch:
-                        console.print(f"     [yellow]⚠️  Primary failed ({e}), trying backup ({backup_ch.source})...[/yellow]")
+                        console.print(f"     [yellow]⚠️  Primary failed ({_esc(e)}), trying backup ({_esc(backup_ch.source)})...[/yellow]")
                         try:
                             file_path = download_chapter(
                                 manga, backup_ch, download_dir, output_format,
@@ -756,7 +768,7 @@ def cmd_check(args):
                             saved = True
                         except DownloaderError as be:
                             backup_e = be
-                            console.print(f"     [red]❌ Backup also failed: {be}[/red]")
+                            console.print(f"     [red]❌ Backup also failed: {_esc(be)}[/red]")
 
                     # 2) Both sources failed to deliver a complete chapter.
                     #    If partial tolerance is on, salvage the best partial
@@ -799,7 +811,7 @@ def cmd_check(args):
                     # 3) Nothing worked — record the failure.
                     if not saved:
                         if backup_ch and backup_e is not None:
-                            console.print(f"     [red]❌ Failed: {e}[/red]")
+                            console.print(f"     [red]❌ Failed: {_esc(e)}[/red]")
                             state.add_failed_chapter(
                                 title, ch.number,
                                 f"{ch_source}+{backup_ch.source}",
@@ -807,7 +819,7 @@ def cmd_check(args):
                                 failed_pages=getattr(e, "failed_pages", None),
                             )
                         else:
-                            console.print(f"     [red]❌ Failed: {e}[/red]")
+                            console.print(f"     [red]❌ Failed: {_esc(e)}[/red]")
                             state.add_failed_chapter(
                                 title, ch.number, ch_source, str(e),
                                 failed_pages=getattr(e, "failed_pages", None),
@@ -815,9 +827,9 @@ def cmd_check(args):
                         total_failed += 1
 
         except DownloaderError as e:
-            console.print(f"  [red]└─ Error: {e}[/red]")
+            console.print(f"  [red]└─ Error: {_esc(e)}[/red]")
         except Exception as e:
-            console.print(f"  [red]└─ Unexpected error: {e}[/red]")
+            console.print(f"  [red]└─ Unexpected error: {_esc(e)}[/red]")
     
     # Record check history with actual counts
     state.update_last_check(new_chapters=total_new, downloaded=total_downloaded)
@@ -831,7 +843,7 @@ def cmd_check(args):
     else:
         console.print(f"[green]📊 Summary: {total_downloaded}/{total_new} chapters downloaded[/green]")
         if delivery_mode == "local":
-            console.print(f"[dim]📁 Downloads: {download_dir}[/dim]")
+            console.print(f"[dim]📁 Downloads: {_esc(download_dir)}[/dim]")
     if total_failed > 0:
         console.print(f"[yellow]⚠️  {total_failed} chapter(s) failed — run 'memanga failed' for details.[/yellow]")
 
@@ -892,14 +904,16 @@ def cmd_status(args):
     delivery_mode = config.delivery_mode
     
     table.add_row("Manga tracked", f"[cyan]{len(manga_list)}[/cyan]")
-    table.add_row("Output format", f"[cyan]{config.output_format}[/cyan]")
-    table.add_row("Delivery mode", f"[yellow]{delivery_mode}[/yellow]")
+    table.add_row("Output format", f"[cyan]{_esc(config.output_format)}[/cyan]")
+    table.add_row("Delivery mode", f"[yellow]{_esc(delivery_mode)}[/yellow]")
     
     if delivery_mode == "local":
-        table.add_row("Download dir", str(config.download_dir))
+        table.add_row("Download dir", _esc(config.download_dir))
     else:
-        table.add_row("Kindle email", config.get("email.kindle_email") or "[red]not set[/red]")
-        table.add_row("Sender email", config.get("email.sender_email") or "[red]not set[/red]")
+        kindle_email = config.get("email.kindle_email")
+        sender_email = config.get("email.sender_email")
+        table.add_row("Kindle email", _esc(kindle_email) if kindle_email else "[red]not set[/red]")
+        table.add_row("Sender email", _esc(sender_email) if sender_email else "[red]not set[/red]")
     
     pp_enabled = bool(config.get("delivery.post_processing.enabled"))
     pp_status = "enabled" if pp_enabled else "disabled"
@@ -910,19 +924,19 @@ def cmd_status(args):
 
     cron_status = "enabled" if config.get("cron.enabled") else "disabled"
     cron_time = config.get("cron.time", "06:00")
-    table.add_row("Cron", f"[{'green' if cron_status == 'enabled' else 'dim'}]{cron_status}[/] ({cron_time})")
+    table.add_row("Cron", f"[{'green' if cron_status == 'enabled' else 'dim'}]{cron_status}[/] ({_esc(cron_time)})")
     
     console.print(table)
     
     # Paths
     console.print()
-    console.print(f"[dim]Config:[/dim] {config.config_path}")
-    console.print(f"[dim]State:[/dim]  {state.state_path}")
+    console.print(f"[dim]Config:[/dim] {_esc(config.config_path)}")
+    console.print(f"[dim]State:[/dim]  {_esc(state.state_path)}")
     
     # Last check
     last_check = state.get("last_check")
     if last_check:
-        console.print(f"[dim]Last check:[/dim] {last_check}")
+        console.print(f"[dim]Last check:[/dim] {_esc(last_check)}")
 
 
 def cmd_config(args):
@@ -936,7 +950,7 @@ def cmd_config(args):
         if pw:
             display["email"]["app_password"] = "****"
         console.print(Panel("[bold]Current Configuration[/bold]", border_style="cyan"))
-        console.print(yaml.dump(display, default_flow_style=False))
+        console.print(_esc(yaml.dump(display, default_flow_style=False)))
         return
 
     # Non-interactive config for partial-chapter tolerance (issue #86).
@@ -964,7 +978,7 @@ def cmd_config(args):
     
     # Delivery mode
     current_mode = config.delivery_mode
-    console.print(f"[bold]Delivery Mode[/bold] (current: [cyan]{current_mode}[/cyan])")
+    console.print(f"[bold]Delivery Mode[/bold] (current: [cyan]{_esc(current_mode)}[/cyan])")
     console.print("  [1] local  - Download PDFs to a directory")
     console.print("  [2] email  - Send PDFs to Kindle via email")
     mode_choice = Prompt.ask("Select mode", choices=["1", "2", ""], default="")
@@ -1008,7 +1022,7 @@ def cmd_config(args):
 
     # Output format
     current_format = config.output_format
-    console.print(f"\n[bold]Output Format[/bold] (current: [cyan]{current_format}[/cyan])")
+    console.print(f"\n[bold]Output Format[/bold] (current: [cyan]{_esc(current_format)}[/cyan])")
     console.print("  [1] pdf   - Portable Document Format")
     console.print("  [2] epub  - E-reader format (Kindle optimized)")
     console.print("  [3] cbz   - Comic Book ZIP archive")
@@ -1127,7 +1141,7 @@ def _cmd_cron_unix(args):
             console.print("[green]✅ Cron job is installed[/green]")
             for line in result.stdout.split("\n"):
                 if "memanga" in line.lower():
-                    console.print(f"[dim]{line}[/dim]")
+                    console.print(f"[dim]{_esc(line)}[/dim]")
         else:
             console.print("[yellow]⚠️  No cron job found[/yellow]")
             console.print("[dim]Use 'memanga cron install' to set up automatic checking.[/dim]")
@@ -1169,7 +1183,7 @@ def _cmd_cron_unix(args):
             config.save()
 
             console.print(f"[green]✅ Cron job installed! Will check daily at {time_str}[/green]")
-            console.print(f"[dim]{cron_line}[/dim]")
+            console.print(f"[dim]{_esc(cron_line)}[/dim]")
         else:
             console.print("[red]Failed to install cron job[/red]")
             return 1
@@ -1217,7 +1231,7 @@ def _cmd_cron_windows(args):
             console.print("[green]✅ Scheduled task is installed[/green]")
             for line in result.stdout.strip().split("\n"):
                 if line.strip():
-                    console.print(f"[dim]{line.strip()}[/dim]")
+                    console.print(f"[dim]{_esc(line.strip())}[/dim]")
         else:
             console.print("[yellow]⚠️  No scheduled task found[/yellow]")
             console.print("[dim]Use 'memanga cron install' to set up automatic checking.[/dim]")
@@ -1263,7 +1277,7 @@ def _cmd_cron_windows(args):
             config.save()
             console.print(f"[green]✅ Scheduled task installed! Will check daily at {time_str}[/green]")
         else:
-            console.print(f"[red]Failed to create scheduled task: {result.stderr.strip()}[/red]")
+            console.print(f"[red]Failed to create scheduled task: {_esc(result.stderr.strip())}[/red]")
             return 1
 
     elif args.action == "remove":
@@ -1349,7 +1363,7 @@ def cmd_search(args):
         try:
             get_scraper(source)
         except ValueError:
-            console.print(f"[red]Unknown source:[/red] {source}")
+            console.print(f"[red]Unknown source:[/red] {_esc(source)}")
             console.print("[dim]Use 'memanga sources' to see supported sources.[/dim]")
             return 1
         sources = [source]
@@ -1363,7 +1377,7 @@ def cmd_search(args):
     quiet = args.json  # keep stdout machine-readable for --json
 
     if not quiet:
-        console.print(f'Searching {len(sources)} sources for [cyan]"{query}"[/cyan]...')
+        console.print(f'Searching {len(sources)} sources for [cyan]"{_esc(query)}"[/cyan]...')
 
     if quiet:
         results, failures = sweep(query, sources, limit=args.limit)
@@ -1428,8 +1442,8 @@ def cmd_search(args):
         summary += f" · {len(failures)} failed ({first.source}: {first.error})"
 
     if not results:
-        console.print(f"[yellow]No results for \"{query}\".[/yellow]")
-        console.print(f"[dim]{summary}[/dim]")
+        console.print(f"[yellow]No results for \"{_esc(query)}\".[/yellow]")
+        console.print(f"[dim]{_esc(summary)}[/dim]")
         return 1
 
     table = Table(box=box.SIMPLE)
@@ -1440,12 +1454,12 @@ def cmd_search(args):
     for i, r in enumerate(results, 1):
         table.add_row(
             str(i),
-            r.source,
-            r.title,
+            _esc(r.source),
+            _esc(r.title),
             str(r.chapter_count) if r.chapter_count is not None else "—",
         )
     console.print(table)
-    console.print(f"[dim]{summary}[/dim]")
+    console.print(f"[dim]{_esc(summary)}[/dim]")
 
     # ── Selection ──
     if args.add is not None:
@@ -1454,9 +1468,9 @@ def cmd_search(args):
             return 1
         ok, message = _add_search_result(results[args.add - 1], args.status)
         if ok:
-            console.print(f"[green]✅ {message}[/green]")
+            console.print(f"[green]✅ {_esc(message)}[/green]")
             return 0
-        console.print(f"[yellow]⚠️  {message}[/yellow]")
+        console.print(f"[yellow]⚠️  {_esc(message)}[/yellow]")
         return 1
 
     # Interactive prompt — only when someone is actually at the
@@ -1475,16 +1489,16 @@ def cmd_search(args):
     try:
         n = int(choice)
     except ValueError:
-        console.print(f"[red]Not a result number:[/red] {choice}")
+        console.print(f"[red]Not a result number:[/red] {_esc(choice)}")
         return 1
     if not (1 <= n <= len(results)):
         console.print(f"[red]Invalid result number:[/red] {n} (valid: 1-{len(results)})")
         return 1
     ok, message = _add_search_result(results[n - 1], args.status)
     if ok:
-        console.print(f"[green]✅ {message}[/green]")
+        console.print(f"[green]✅ {_esc(message)}[/green]")
         return 0
-    console.print(f"[yellow]⚠️  {message}[/yellow]")
+    console.print(f"[yellow]⚠️  {_esc(message)}[/yellow]")
     return 1
 
 
@@ -1506,7 +1520,7 @@ def cmd_export(args):
     with open(output_path, "w") as f:
         json.dump(export_data, f, indent=2, default=str)
 
-    console.print(f"[green]Exported {len(manga_list)} manga to [cyan]{output_path}[/cyan][/green]")
+    console.print(f"[green]Exported {len(manga_list)} manga to [cyan]{_esc(output_path)}[/cyan][/green]")
 
 
 def cmd_import(args):
@@ -1514,7 +1528,7 @@ def cmd_import(args):
     import_path = Path(args.file)
 
     if not import_path.exists():
-        console.print(f"[red]File not found:[/red] {import_path}")
+        console.print(f"[red]File not found:[/red] {_esc(import_path)}")
         return 1
 
     with open(import_path, "r") as f:
@@ -1523,7 +1537,7 @@ def cmd_import(args):
     try:
         import_data = validate_backup(import_data)
     except BackupVersionError as exc:
-        console.print(f"[red]Cannot import:[/red] {exc}")
+        console.print(f"[red]Cannot import:[/red] {_esc(exc)}")
         return 1
 
     if "manga" not in import_data:
@@ -1679,14 +1693,14 @@ def cmd_failed(args):
             pages = info.get("failed_pages", [])
             pages_str = str(pages) if pages else "—"
             table.add_row(
-                manga_title,
-                chapter_num,
+                _esc(manga_title),
+                _esc(chapter_num),
                 "partial" if is_partial else "failed",
-                recorded_at,
-                info.get("source", "?"),
-                pages_str,
-                "—" if is_partial else str(info.get("attempts", 1)),
-                info.get("error", ""),
+                _esc(recorded_at),
+                _esc(info.get("source", "?")),
+                _esc(pages_str),
+                "—" if is_partial else _esc(info.get("attempts", 1)),
+                _esc(info.get("error", "")),
             )
 
     console.print(table)
@@ -1716,7 +1730,7 @@ def cmd_failed(args):
         for manga_title, chapters in retryable.items():
             manga = manga_by_title.get(manga_title)
             if not manga:
-                console.print(f"  [yellow]⚠️  Manga not found in config: {manga_title}[/yellow]")
+                console.print(f"  [yellow]⚠️  Manga not found in config: {_esc(manga_title)}[/yellow]")
                 continue
 
             for chapter_num, info in sorted(chapters.items(), key=_chapter_order):
@@ -1734,25 +1748,25 @@ def cmd_failed(args):
                     ch_obj = None
 
                 if not ch_obj:
-                    console.print(f"  [yellow]⚠️  Could not find Chapter {chapter_num} of {manga_title} on primary source[/yellow]")
+                    console.print(f"  [yellow]⚠️  Could not find Chapter {_esc(chapter_num)} of {_esc(manga_title)} on primary source[/yellow]")
                     # Try backup directly
                     ch_obj = _find_chapter_on_backup(manga, chapter_num)
                     if not ch_obj:
-                        console.print(f"  [red]❌ Chapter {chapter_num} not found on any source[/red]")
+                        console.print(f"  [red]❌ Chapter {_esc(chapter_num)} not found on any source[/red]")
                         retried += 1
                         continue
                 else:
                     ch_obj = ChapterWithSource(ch_obj, src["source"], src["url"], is_backup=False)
 
-                console.print(f"  [dim]⬇️  Retrying {manga_title} Chapter {chapter_num}...[/dim]")
+                console.print(f"  [dim]⬇️  Retrying {_esc(manga_title)} Chapter {_esc(chapter_num)}...[/dim]")
                 retried += 1
                 try:
                     file_path = download_chapter(manga, ch_obj, download_dir, output_format, post_processing=post_processing)
                     is_image_folder = file_path.is_dir()
                     if is_image_folder:
-                        console.print(f"  [green]✅ Saved: {file_path.parent.name}/{file_path.name}/[/green]")
+                        console.print(f"  [green]✅ Saved: {_esc(f'{file_path.parent.name}/{file_path.name}/')}[/green]")
                     else:
-                        console.print(f"  [green]✅ Saved: {file_path.name}[/green]")
+                        console.print(f"  [green]✅ Saved: {_esc(file_path.name)}[/green]")
 
                     if delivery_mode == "email" and email_cfg.get("kindle_email") and not is_image_folder:
                         try:
@@ -1766,7 +1780,7 @@ def cmd_failed(args):
                             )
                             console.print(f"  [green]📬 Sent to Kindle![/green]")
                         except EmailError as email_e:
-                            console.print(f"  [red]📧 Email failed: {email_e}[/red]")
+                            console.print(f"  [red]📧 Email failed: {_esc(email_e)}[/red]")
 
                     state.add_downloaded_chapter(manga_title, chapter_num)
                     state.clear_failed_chapter(manga_title, chapter_num)
@@ -1776,20 +1790,20 @@ def cmd_failed(args):
                     # Try backup if available
                     backup_ch = _find_chapter_on_backup(manga, chapter_num)
                     if backup_ch:
-                        console.print(f"  [yellow]⚠️  Primary failed, trying backup ({backup_ch.source})...[/yellow]")
+                        console.print(f"  [yellow]⚠️  Primary failed, trying backup ({_esc(backup_ch.source)})...[/yellow]")
                         try:
                             file_path = download_chapter(manga, backup_ch, download_dir, output_format, post_processing=post_processing)
                             state.add_downloaded_chapter(manga_title, chapter_num)
                             state.clear_failed_chapter(manga_title, chapter_num)
                             state.clear_partial_chapter(manga_title, chapter_num)
                             label = f"{file_path.parent.name}/{file_path.name}/" if file_path.is_dir() else file_path.name
-                            console.print(f"  [green]✅ Saved from backup: {label}[/green]")
+                            console.print(f"  [green]✅ Saved from backup: {_esc(label)}[/green]")
                             succeeded += 1
                             continue
                         except DownloaderError:
                             pass
                     state.add_failed_chapter(manga_title, chapter_num, info.get("source", "?"), str(retry_e))
-                    console.print(f"  [red]❌ Still failing: {retry_e}[/red]")
+                    console.print(f"  [red]❌ Still failing: {_esc(retry_e)}[/red]")
 
         console.print()
         console.print(f"[green]📊 Retry summary: {succeeded}/{retried} chapters recovered[/green]")
@@ -1809,8 +1823,6 @@ def cmd_doctor(args):
     Exit code: 0 when no selected check failed, 1 when one did (or,
     with --strict, when one warned). Usage errors exit 2 via argparse.
     """
-    from rich.markup import escape
-
     only = set(args.check) if args.check else None
 
     def run():
@@ -1832,10 +1844,10 @@ def cmd_doctor(args):
     table.add_column(style="cyan")
     table.add_column(no_wrap=False)
     for r in results:
-        message = escape(r.message)
+        message = _esc(r.message)
         if r.status == doctor.SKIP:
             message = f"[dim]{message}[/dim]"
-        table.add_row(_DOCTOR_ICONS[r.status], r.name, message)
+        table.add_row(_DOCTOR_ICONS[r.status], _esc(r.name), message)
     console.print(table)
 
     report = doctor.build_report(results)
@@ -1883,7 +1895,7 @@ def cmd_tui(args):
         table.add_column(style="dim")
 
         for key, title, desc in menu_items:
-            table.add_row(f"[{key}]", title, desc)
+            table.add_row(_esc(f"[{key}]"), title, desc)
 
         console.print(table)
         console.print()
@@ -1915,7 +1927,7 @@ def cmd_tui(args):
                 manga_list_ref = config.get("manga", [])
                 found, _ = _find_manga(target, manga_list_ref)
                 if not found:
-                    console.print(f"[red]Not found:[/red] {target}")
+                    console.print(f"[red]Not found:[/red] {_esc(target)}")
                 else:
                     title = found["title"]
 
