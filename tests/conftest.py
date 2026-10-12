@@ -53,6 +53,8 @@ def isolated_home(monkeypatch, tmp_path) -> Path:
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("APPDATA", str(tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    # A developer's MEMANGA_CONFIG_DIR would point the CLI elsewhere.
+    monkeypatch.delenv("MEMANGA_CONFIG_DIR", raising=False)
     (tmp_path / ".config" / "memanga").mkdir(parents=True, exist_ok=True)
     return tmp_path
 

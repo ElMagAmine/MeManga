@@ -19,8 +19,6 @@ def invoke(monkeypatch, isolated_home):
     """Call cli.main() with patched argv; return exit code."""
     def _call(*argv):
         import memanga.cli as cli
-        from memanga.config import Config
-        cli.config = Config()
         monkeypatch.setattr(sys, "argv", ["memanga"] + list(argv))
         try:
             cli.main()
@@ -35,8 +33,6 @@ class TestCliOnlyEnvVar:
         monkeypatch.setenv("MEMANGA_CLI_ONLY", "1")
         monkeypatch.setattr(sys, "argv", ["memanga", "--help"])
         import memanga.cli as cli
-        from memanga.config import Config
-        cli.config = Config()
         with pytest.raises(SystemExit) as exc:
             cli.main()
         assert exc.value.code == 0
@@ -48,8 +44,6 @@ class TestCliOnlyEnvVar:
         monkeypatch.setenv("MEMANGA_CLI_ONLY", "1")
         monkeypatch.setattr(sys, "argv", ["memanga", "--help"])
         import memanga.cli as cli
-        from memanga.config import Config
-        cli.config = Config()
         with pytest.raises(SystemExit) as exc:
             cli.main()
         assert exc.value.code == 0
@@ -60,8 +54,6 @@ class TestCliOnlyEnvVar:
         monkeypatch.setenv("MEMANGA_CLI_ONLY", "1")
         monkeypatch.setattr(sys, "argv", ["memanga", "--gui"])
         import memanga.cli as cli
-        from memanga.config import Config
-        cli.config = Config()
         with pytest.raises(SystemExit) as exc:
             cli.main()
         assert exc.value.code == 1
@@ -73,8 +65,6 @@ class TestCliOnlyEnvVar:
         monkeypatch.delenv("MEMANGA_CLI_ONLY", raising=False)
         monkeypatch.setattr(sys, "argv", ["memanga", "--help"])
         import memanga.cli as cli
-        from memanga.config import Config
-        cli.config = Config()
         with pytest.raises(SystemExit) as exc:
             cli.main()
         assert exc.value.code == 0
@@ -87,8 +77,6 @@ class TestCliOnlyEnvVar:
         monkeypatch.delenv("MEMANGA_CLI_ONLY", raising=False)
         monkeypatch.setattr(sys, "argv", ["memanga", "--gui"])
         import memanga.cli as cli
-        from memanga.config import Config
-        cli.config = Config()
         launched = []
         fake_gui = types.SimpleNamespace(launch_gui=lambda: launched.append(True))
         monkeypatch.setitem(sys.modules, "memanga.gui", fake_gui)

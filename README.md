@@ -437,6 +437,12 @@ commands, scraper-add walkthroughs, and the lock-refresh flow.
 | `~/.config/memanga/crash.log` | Uncaught exceptions from the windowed release exe |
 | `~/Downloads/MeManga/<title>/` | Default download folder (changeable in Settings) |
 
+The CLI can use another directory for `config.yaml` and `state.json`:
+`memanga --config-dir DIR <command>` (the option goes before the
+command), or set `MEMANGA_CONFIG_DIR=DIR`. The flag wins over the
+variable. `cron install` keeps the selected directory in the scheduled
+check. The GUI always uses `~/.config/memanga/`.
+
 Sensitive credentials (SMTP App Password) are stored in the OS keyring
 (Keychain on macOS, Credential Manager on Windows, Secret Service on
 Linux).

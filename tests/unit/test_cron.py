@@ -39,6 +39,15 @@ class TestBuildCronLine:
             ">> '/opt/My Manga/memanga.log' 2>&1"
         )
 
+    def test_config_dir_is_passed_to_scheduled_check(self):
+        line = build_cron_line(0, 6, "/opt/memanga", "/usr/bin/python3",
+                               config_dir="/srv/My Manga/config")
+        command = line.split("* * * ", 1)[1]
+        assert shlex.split(command)[3:9] == [
+            "/usr/bin/python3", "-m", "memanga",
+            "--config-dir", "/srv/My Manga/config", "check",
+        ]
+
     def test_metacharacter_paths_stay_single_words(self):
         evil = "/tmp/x; touch pwned"
         line = build_cron_line(0, 6, evil, "/usr/bin/python3")

@@ -7,7 +7,9 @@ Each subcommand is exercised at least once. Network-touching paths
 from __future__ import annotations
 
 import json
+import os
 import pytest
+import shlex
 import sys
 import types
 from unittest.mock import patch, MagicMock
@@ -17,19 +19,18 @@ from unittest.mock import patch, MagicMock
 def run_cli(monkeypatch, isolated_home):
     """Helper: run `cli.main()` with synthetic argv.
 
-    The CLI builds a module-level `config = Config()` at import time, so
-    we rebind it to a fresh Config rooted in the isolated home before
-    each invocation. Otherwise tests would share the developer's real
-    config dir.
+    Every invocation passes `--config-dir` pointing into the isolated
+    home, so main() builds a fresh Config/State from disk there and
+    writes from earlier `run_cli` calls in the same test are visible.
     """
+    config_dir = isolated_home / ".config" / "memanga"
+
     def _run(*argv):
-        monkeypatch.setattr(sys, "argv", ["memanga"] + list(argv))
+        monkeypatch.setattr(
+            sys, "argv",
+            ["memanga", "--config-dir", str(config_dir)] + list(argv),
+        )
         from memanga import cli
-        from memanga.config import Config
-        # Always start from a fresh on-disk read so writes from earlier
-        # `run_cli` calls in the same test are visible. Tolerant, like the
-        # module-level instance.
-        cli.config = Config(tolerate_errors=True)
         try:
             cli.main()
         except SystemExit as exc:
@@ -239,7 +240,6 @@ class TestCheckCommand:
         delivery before the chapter is marked downloaded."""
         from memanga import cli
         from memanga.downloader import DownloaderError
-        from memanga.state import State
 
         config.set("delivery.mode", "email")
         config.set("email.kindle_email", "reader@example.com")
@@ -254,7 +254,6 @@ class TestCheckCommand:
         }])
         config.save()
 
-        cli.state = State()
         primary_ch = types.SimpleNamespace(
             number="71", title="", url="https://primary.test/c/71",
             source="primary.test", is_backup=False)
@@ -295,7 +294,6 @@ class TestCheckCommand:
         partial must be delivered and logged before state is advanced."""
         from memanga import cli
         from memanga.downloader import DownloaderError
-        from memanga.state import State
 
         config.set("delivery.mode", "email")
         config.set("email.kindle_email", "reader@example.com")
@@ -312,7 +310,6 @@ class TestCheckCommand:
         }])
         config.save()
 
-        cli.state = State()
         primary_ch = types.SimpleNamespace(
             number="71", title="", url="https://primary.test/c/71",
             source="primary.test", is_backup=False)
@@ -360,7 +357,6 @@ class TestCheckCommand:
         chapter stays failed and is not marked downloaded."""
         from memanga import cli
         from memanga.downloader import DownloaderError
-        from memanga.state import State
 
         config.set("partial_chapters.enabled", True)
         config.set("partial_chapters.threshold_percent", 1)
@@ -374,7 +370,6 @@ class TestCheckCommand:
         }])
         config.save()
 
-        cli.state = State()
         primary_ch = types.SimpleNamespace(
             number="71", title="", url="https://primary.test/c/71",
             source="primary.test", is_backup=False)
@@ -401,10 +396,9 @@ class TestCheckCommand:
         assert "71" in failed
 
     def test_failed_retry_includes_accepted_partials(
-            self, run_cli, config, monkeypatch, tmp_path):
+            self, run_cli, config, state, monkeypatch, tmp_path):
         from memanga import cli
         from memanga.scrapers.base import Chapter
-        from memanga.state import State
 
         config.set("manga", [{
             "title": "Vinland Saga",
@@ -414,15 +408,15 @@ class TestCheckCommand:
         }])
         config.save()
 
-        cli.state = State()
-        cli.state.add_downloaded_chapter("Vinland Saga", "71")
-        cli.state.add_partial_chapter(
+        state.add_downloaded_chapter("Vinland Saga", "71")
+        state.add_partial_chapter(
             "Vinland Saga",
             "71",
             source="primary.test",
             failed_pages=[7],
             total_pages=40,
         )
+        state.save()
         fixed_path = tmp_path / "fixed.pdf"
         fixed_path.write_bytes(b"%PDF")
 
@@ -578,8 +572,8 @@ class TestExportImport:
                               "source": "mangadex.org",
                               "status": "reading"}])
         config.save()
-        cli.state = State(config_dir=isolated_home / ".config" / "memanga")
-        cli.state.set("manga", {
+        state = State(config_dir=isolated_home / ".config" / "memanga")
+        state.set("manga", {
             "Stateful": {
                 "downloaded": ["1"],
                 "read_chapters": ["1"],
@@ -636,8 +630,8 @@ class TestExportImport:
 
         config.set("manga", [])
         config.save()
-        cli.state = State(config_dir=isolated_home / ".config" / "memanga")
-        cli.state.set("manga", {
+        state = State(config_dir=isolated_home / ".config" / "memanga")
+        state.set("manga", {
             "Stateful": {
                 "downloaded": ["1"],
                 "failed_chapters": {
@@ -683,17 +677,15 @@ class TestExportImport:
         assert "RoundTrip" in titles
 
     def test_import_merge_unions_downloaded_state(self, run_cli, config,
-                                                  isolated_home, monkeypatch,
-                                                  tmp_path):
-        from memanga import cli as cli_mod
+                                                  isolated_home, tmp_path):
         from memanga.state import State
 
         config.set("manga", [{"title": "Existing", "url": "u",
                               "source": "mangadex.org", "status": "reading"}])
         config.save()
         state = State(config_dir=isolated_home / ".config" / "memanga")
-        monkeypatch.setattr(cli_mod, "state", state)
         state.add_downloaded_chapter("Existing", "1")
+        state.save()
 
         backup = tmp_path / "merge-state.json"
         backup.write_text(json.dumps({
@@ -920,49 +912,78 @@ class TestSearchCommand:
 # ─────────────────────────────────────────────────────────────────────────
 
 
+def _capture_crontab(monkeypatch):
+    """Fake an empty crontab on Linux; return the dict that receives the
+    text `cron install` submits under ``"crontab"``."""
+    from memanga import cli
+
+    submitted = {}
+
+    class _FakePopen:
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def communicate(self, input=None):
+            submitted["crontab"] = input
+            return ("", "")
+
+    monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        cli.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="",
+                                              stderr=""))
+    monkeypatch.setattr(cli.subprocess, "Popen", _FakePopen)
+    return submitted
+
+
+def _expected_cron_line(config_dir=None):
+    from pathlib import Path
+
+    from memanga import cli
+    from memanga.cron import build_cron_line
+
+    project_dir = Path(cli.__file__).resolve().parent.parent
+    python_path = project_dir / "venv" / "bin" / "python3"
+    if not python_path.exists():
+        python_path = Path(sys.executable)
+    return build_cron_line(0, 6, project_dir, python_path,
+                           config_dir=config_dir)
+
+
 class TestCronCommand:
     def test_cron_status_safe(self, run_cli):
         # Status should never write anything system-wide
         rc = run_cli("cron", "status")
         assert rc in (0, 1, 2)
 
-    def test_cron_install_submits_quoted_line(self, run_cli, monkeypatch):
+    def test_cron_install_submits_quoted_line(self, run_cli, monkeypatch,
+                                              isolated_home):
         """#109: `cron install` must submit the shell-safe crontab line
-        from build_cron_line() so paths with spaces survive."""
-        from pathlib import Path
-
-        from memanga import cli
-        from memanga.cron import build_cron_line
-
-        monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
-
-        submitted = {}
-
-        class _FakePopen:
-            returncode = 0
-
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def communicate(self, input=None):
-                submitted["crontab"] = input
-                return ("", "")
-
-        monkeypatch.setattr(
-            cli.subprocess, "run",
-            lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="",
-                                                  stderr=""))
-        monkeypatch.setattr(cli.subprocess, "Popen", _FakePopen)
+        from build_cron_line() so paths with spaces survive. run_cli
+        selects a config dir, which the line keeps (#221)."""
+        submitted = _capture_crontab(monkeypatch)
 
         rc = run_cli("cron", "install", "--time", "06:00")
         assert rc == 0
 
-        project_dir = Path(cli.__file__).resolve().parent.parent
-        python_path = project_dir / "venv" / "bin" / "python3"
-        if not python_path.exists():
-            python_path = Path(sys.executable)
-        expected = build_cron_line(0, 6, project_dir, python_path)
+        expected = _expected_cron_line(isolated_home / ".config" / "memanga")
         assert expected in submitted["crontab"].splitlines()
+
+    def test_cron_install_default_dir_omits_config_dir(self, isolated_home,
+                                                       monkeypatch):
+        """#221: with no flag or $MEMANGA_CONFIG_DIR the scheduled check
+        keeps the pre-#221 line, so it follows the default root."""
+        from memanga import cli
+
+        submitted = _capture_crontab(monkeypatch)
+        monkeypatch.setattr(sys, "argv",
+                            ["memanga", "cron", "install", "--time", "06:00"])
+        cli.main()
+
+        assert _expected_cron_line() in submitted["crontab"].splitlines()
+        assert "--config-dir" not in submitted["crontab"]
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -990,13 +1011,11 @@ class TestTuiCommand:
 
 
 @pytest.fixture
-def cli_state(isolated_home, monkeypatch):
-    """Point the CLI's module-level State at the isolated home."""
-    from memanga import cli
+def cli_state(isolated_home):
+    """State in the config dir `run_cli` selects. main() loads it from
+    disk, so seed with persisting mutators or call save()."""
     from memanga.state import State
-    fresh = State()
-    monkeypatch.setattr(cli, "state", fresh)
-    return fresh
+    return State(config_dir=isolated_home / ".config" / "memanga")
 
 
 def _stdout_json(capsys):
@@ -1020,6 +1039,7 @@ class TestListJson:
         config.save()
         cli_state.add_downloaded_chapter("Multi", "1")
         cli_state.add_downloaded_chapter("Multi", "2")
+        cli_state.save()
         capsys.readouterr()
 
         assert run_cli("list", "--json") == 0
@@ -1064,6 +1084,95 @@ class TestStatusJson:
         assert payload["post_processing"]["enabled"] is False
         assert payload["last_check"] is None
         assert payload["paths"]["state"] == str(cli_state.state_path)
+
+
+class TestConfigDir:
+    """Issue #221: the config root is chosen per run, after parsing."""
+
+    @staticmethod
+    def _status_paths(monkeypatch, capsys, *argv):
+        from memanga import cli
+        monkeypatch.setattr(sys, "argv", ["memanga", *argv, "status", "--json"])
+        capsys.readouterr()
+        cli.main()
+        return _stdout_json(capsys)["paths"]
+
+    def test_import_does_not_create_config_dir(self, tmp_path):
+        import subprocess
+        from pathlib import Path
+        import memanga
+
+        home = tmp_path / "fresh-home"
+        home.mkdir()
+        env = {k: v for k, v in os.environ.items()
+               if k != "MEMANGA_CONFIG_DIR"}
+        env.update(HOME=str(home), USERPROFILE=str(home))
+        subprocess.run(
+            [sys.executable, "-c", "import memanga.cli"],
+            cwd=Path(memanga.__file__).resolve().parent.parent,
+            env=env, check=True, timeout=120,
+        )
+        assert not (home / ".config" / "memanga").exists()
+
+    def test_flag_selects_config_and_state(self, isolated_home, monkeypatch,
+                                           capsys, tmp_path):
+        from memanga import cli
+        root = tmp_path / "portable"
+        paths = self._status_paths(monkeypatch, capsys, "--config-dir", str(root))
+        assert paths == {
+            "config_dir": str(root),
+            "config": str(root / "config.yaml"),
+            "state": str(root / "state.json"),
+        }
+        assert cli.config.config_dir == cli.state.config_dir == root
+
+        monkeypatch.setattr(sys, "argv", ["memanga", "--config-dir", str(root),
+                                          "config", "--partial", "on"])
+        cli.main()
+        assert (root / "config.yaml").exists()
+        assert not (isolated_home / ".config" / "memanga" / "config.yaml").exists()
+
+    def test_env_var_selects_config_dir(self, isolated_home, monkeypatch,
+                                        capsys, tmp_path):
+        root = tmp_path / "from-env"
+        monkeypatch.setenv("MEMANGA_CONFIG_DIR", str(root))
+        paths = self._status_paths(monkeypatch, capsys)
+        assert paths["config"] == str(root / "config.yaml")
+        assert paths["state"] == str(root / "state.json")
+
+    def test_flag_overrides_env_var(self, isolated_home, monkeypatch, capsys,
+                                    tmp_path):
+        monkeypatch.setenv("MEMANGA_CONFIG_DIR", str(tmp_path / "from-env"))
+        root = tmp_path / "from-flag"
+        paths = self._status_paths(monkeypatch, capsys, "--config-dir", str(root))
+        assert paths["config_dir"] == str(root)
+        assert not (tmp_path / "from-env").exists()
+
+    def test_default_is_home_config(self, isolated_home, monkeypatch, capsys):
+        paths = self._status_paths(monkeypatch, capsys)
+        assert paths["config_dir"] == str(isolated_home / ".config" / "memanga")
+
+    def test_rejected_with_gui(self, isolated_home, monkeypatch, tmp_path):
+        from memanga import cli
+        monkeypatch.delenv("MEMANGA_CLI_ONLY", raising=False)
+        monkeypatch.setattr(sys, "argv", ["memanga", "--config-dir",
+                                          str(tmp_path / "x"), "--gui"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2
+
+    def test_cron_install_keeps_config_dir(self, isolated_home, monkeypatch,
+                                           tmp_path):
+        from memanga import cli
+        root = tmp_path / "portable"
+        submitted = _capture_crontab(monkeypatch)
+        monkeypatch.setattr(sys, "argv", ["memanga", "--config-dir", str(root),
+                                          "cron", "install", "--time", "06:00"])
+        cli.main()
+        line, = [l for l in submitted["crontab"].splitlines() if l]
+        command = shlex.split(line.split("* * * ", 1)[1])
+        i = command.index("memanga")
+        assert command[i + 1:i + 4] == ["--config-dir", str(root), "check"]
 
 
 class TestFailedJson:
