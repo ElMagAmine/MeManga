@@ -572,7 +572,8 @@ class TestCliForceSuspicious:
         )
         cli.cmd_check(self._check_args())
 
-        out = capsys.readouterr().out
-        assert "Suspicious chapter batch detected" in out
-        assert "--force-suspicious" in out
-        assert "Skipped auto-delivery" in out
+        # Withheld delivery is a warning, so it goes to stderr (#239).
+        err = capsys.readouterr().err
+        assert "Suspicious chapter batch detected" in err
+        assert "--force-suspicious" in err
+        assert "Skipped auto-delivery" in err
