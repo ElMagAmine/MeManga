@@ -29,6 +29,12 @@ All notable changes are recorded here. Format loosely follows
 - #250 An invalid `config.yaml` no longer crashes the CLI with a
   traceback. `memanga doctor` reports it as a failed `config` check;
   other commands exit 1 with a short error and leave the file untouched.
+- #238 `memanga add` only asks questions with `--interactive`. Without it,
+  an unsupported source or a similar tracked title exits 1 with an error
+  instead of prompting, even in a terminal; pass the new `--force` (or the
+  existing `--yes`) to add it anyway. Exact duplicates are still refused.
+  An invalid fallback delay in interactive mode asks again instead of
+  crashing.
 
 ## [0.4.4] - 2026-10-03
 

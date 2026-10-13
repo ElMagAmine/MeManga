@@ -1447,13 +1447,19 @@ class TestNonInteractive:
     def _titles(self, config):
         return [m["title"] for m in config.get("manga", []) or []]
 
-    def test_add_unsupported_source_fails_without_yes(self, run_cli, config,
-                                                      capsys):
+    def test_add_unsupported_source_fails_without_force(self, run_cli, config,
+                                                        capsys):
         rc = run_cli("add", "--title", "Unsafe",
                      "--url", "https://unsupported.example/manga")
         assert rc == 1
-        assert "--yes" in capsys.readouterr().err
+        assert "--force" in capsys.readouterr().err
         assert "Unsafe" not in self._titles(config)
+
+    def test_add_unsupported_source_with_force(self, run_cli, config):
+        rc = run_cli("add", "--title", "Unsafe", "--force",
+                     "--url", "https://unsupported.example/manga")
+        assert rc == 0
+        assert "Unsafe" in self._titles(config)
 
     def test_add_unsupported_source_with_yes(self, run_cli, config):
         rc = run_cli("add", "--title", "Unsafe", "--yes",
@@ -1475,6 +1481,21 @@ class TestNonInteractive:
                      "--url", "https://mangadex.org/title/z/x")
         assert rc == 0
         assert "One Piece Color" in self._titles(config)
+
+    def test_add_similar_title_with_force(self, run_cli, config):
+        self._seed(config, "One Piece")
+        rc = run_cli("add", "--title", "One Piece Color", "-f",
+                     "--url", "https://mangadex.org/title/z/x")
+        assert rc == 0
+        assert "One Piece Color" in self._titles(config)
+
+    def test_force_does_not_bypass_exact_duplicate(self, run_cli, config,
+                                                   capsys):
+        self._seed(config, "One Piece")
+        run_cli("add", "--title", "one piece", "--force",
+                "--url", "https://mangadex.org/title/z/x")
+        assert self._titles(config) == ["One Piece"]
+        assert "already exists" in capsys.readouterr().out
 
     def test_add_interactive_flag_fails(self, run_cli, capsys):
         assert run_cli("add", "--interactive") == 1
@@ -1589,3 +1610,66 @@ class TestInteractiveStillPrompts:
         monkeypatch.setattr(sys, "stdin", _TtyInput("\n"))
         assert run_cli("cron", "install") == 0
         assert "crontab" in submitted
+
+
+class TestAddPrompts:
+    """`add` prompts only with --interactive, even on a terminal (#238)."""
+
+    @pytest.fixture(autouse=True)
+    def no_network(self, monkeypatch):
+        from memanga import cli
+
+        def _no_scraper(source):
+            raise RuntimeError("no network in tests")
+        monkeypatch.setattr(cli, "get_scraper", _no_scraper)
+
+    def _titles(self, config):
+        return [m["title"] for m in config.get("manga", []) or []]
+
+    def test_flag_add_on_tty_does_not_prompt(self, run_cli, config,
+                                             monkeypatch, capsys):
+        # "y" would be read if add still asked "Add anyway?".
+        monkeypatch.setattr(sys, "stdin", _TtyInput("y\n"))
+        rc = run_cli("add", "--title", "Unsafe",
+                     "--url", "https://unsupported.example/manga")
+        assert rc == 1
+        assert "--force" in capsys.readouterr().err
+        assert "Unsafe" not in self._titles(config)
+
+    def test_flag_add_similar_title_on_tty_does_not_prompt(self, run_cli, config,
+                                                           monkeypatch, capsys):
+        config.set("manga", [{"title": "One Piece", "source": "mangadex.org",
+                              "url": "https://mangadex.org/title/a/x"}])
+        config.save()
+        monkeypatch.setattr(sys, "stdin", _TtyInput("y\n"))
+        rc = run_cli("add", "--title", "One Piece Color",
+                     "--url", "https://mangadex.org/title/z/x")
+        assert rc == 1
+        assert "similar manga" in capsys.readouterr().err
+        assert self._titles(config) == ["One Piece"]
+
+    def test_interactive_unsupported_source_still_confirms(self, run_cli, config,
+                                                           monkeypatch):
+        # title, url, no backup, then "Add anyway?" -> yes
+        monkeypatch.setattr(sys, "stdin", _TtyInput(
+            "Unsafe\nhttps://unsupported.example/manga\nn\ny\n"))
+        assert run_cli("add", "--interactive") == 0
+        assert "Unsafe" in self._titles(config)
+
+    def test_interactive_invalid_fallback_days_reprompts(self, run_cli, config,
+                                                         monkeypatch, capsys):
+        monkeypatch.setattr(sys, "stdin", _TtyInput(
+            "Blue Lock\n"
+            "https://mangadex.org/title/a/x\n"
+            "y\n"
+            "https://mangapill.com/manga/1/x\n"
+            "abc\n"
+            "-1\n"
+            "3\n"))
+        assert run_cli("add", "--interactive") == 0
+        out = capsys.readouterr().out
+        assert "valid integer" in out
+        assert "0 or more days" in out
+        [entry] = config.get("manga", [])
+        assert entry["title"] == "Blue Lock"
+        assert entry["fallback_delay_days"] == 3
