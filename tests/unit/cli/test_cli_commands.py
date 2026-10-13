@@ -1894,3 +1894,159 @@ class TestCheckExitCodes:
         captured = capsys.readouterr()
         assert "0/1 chapters recovered" in captured.out
         assert "No source to retry Chapter 7 of Alpha" in captured.err
+
+
+class TestTargetMatching:
+    """Tracked-manga targets resolve to exactly one entry (#237)."""
+
+    @pytest.fixture(autouse=True)
+    def no_tty(self, monkeypatch):
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+    def _seed(self, config, *titles):
+        config.set("manga", [
+            {"title": t, "source": "mangadex.org",
+             "url": f"https://mangadex.org/title/{i}/x", "status": "reading"}
+            for i, t in enumerate(titles)
+        ])
+        config.save()
+
+    def _titles(self, config):
+        return [m["title"] for m in config.get("manga", []) or []]
+
+    def _status(self, config, title):
+        return [m for m in config.get("manga", [])
+                if m["title"] == title][0]["status"]
+
+    def test_ambiguous_substring_refuses_and_lists(self, run_cli, config,
+                                                   capsys):
+        self._seed(config, "One Piece", "One Punch-Man", "Berserk")
+        capsys.readouterr()
+        assert run_cli("rm", "one", "--yes") == 1
+        captured = capsys.readouterr()
+        assert "Ambiguous" in captured.err
+        assert "One Piece" in captured.err
+        assert "One Punch-Man" in captured.err
+        assert "Berserk" not in captured.err
+        assert captured.out == ""
+        assert self._titles(config) == ["One Piece", "One Punch-Man", "Berserk"]
+
+    @pytest.mark.parametrize("argv", [
+        ("set", "one", "dropped"),
+        ("update", "one", "--title", "New"),
+        ("check", "-t", "one"),
+    ])
+    def test_ambiguous_target_fails_everywhere(self, run_cli, config, capsys,
+                                               monkeypatch, argv):
+        from memanga import cli
+
+        monkeypatch.setattr(cli, "check_for_updates", lambda *a, **k: [])
+        self._seed(config, "One Piece", "One Punch-Man")
+        capsys.readouterr()
+        assert run_cli(*argv) == 1
+        captured = capsys.readouterr()
+        assert "Ambiguous" in captured.err
+        assert captured.out == ""
+        assert self._titles(config) == ["One Piece", "One Punch-Man"]
+        assert self._status(config, "One Piece") == "reading"
+
+    def test_exact_match_wins_over_substring(self, run_cli, config):
+        self._seed(config, "One Piece Colored", "One Piece")
+        assert run_cli("set", "one piece", "dropped") == 0
+        assert self._status(config, "One Piece") == "dropped"
+        assert self._status(config, "One Piece Colored") == "reading"
+
+    def test_unique_substring_still_matches(self, run_cli, config):
+        self._seed(config, "One Piece", "Berserk")
+        assert run_cli("set", "berse", "on-hold") == 0
+        assert self._status(config, "Berserk") == "on-hold"
+
+    def test_numeric_title_is_a_title(self, run_cli, config):
+        # "1" used to mean the first entry; it is now a title lookup.
+        self._seed(config, "Berserk", "86", "1")
+        assert run_cli("set", "86", "completed") == 0
+        assert self._status(config, "86") == "completed"
+        assert run_cli("rm", "1", "--yes") == 0
+        assert self._titles(config) == ["Berserk", "86"]
+
+    def test_bare_number_is_not_an_index(self, run_cli, config, capsys):
+        self._seed(config, "Berserk", "Vinland Saga")
+        capsys.readouterr()
+        assert run_cli("rm", "2", "--yes") == 1
+        assert "Not found" in capsys.readouterr().err
+        assert self._titles(config) == ["Berserk", "Vinland Saga"]
+
+    def test_bare_number_never_substring_matches(self, run_cli, config,
+                                                 capsys):
+        # "1" is a substring of only "Mob Psycho 100"; it must not hit it.
+        self._seed(config, "One Piece", "Mob Psycho 100", "Berserk")
+        capsys.readouterr()
+        assert run_cli("rm", "1", "--yes") == 1
+        captured = capsys.readouterr()
+        assert "Not found" in captured.err
+        assert "#1" in captured.err
+        assert captured.out == ""
+        assert self._titles(config) == ["One Piece", "Mob Psycho 100", "Berserk"]
+
+    def test_bare_number_exact_title_beside_substring(self, run_cli, config):
+        self._seed(config, "Mob Psycho 100", "1")
+        assert run_cli("set", "1", "dropped") == 0
+        assert self._status(config, "1") == "dropped"
+        assert self._status(config, "Mob Psycho 100") == "reading"
+
+    def test_hash_index_rejects_non_ascii_digits(self, run_cli, config,
+                                                 capsys):
+        # "²".isdigit() is True but int("²") raises; "١" is Arabic-Indic one.
+        self._seed(config, "Berserk", "86")
+        for target in ("#²", "#\u0661"):
+            capsys.readouterr()
+            assert run_cli("rm", target, "--yes") == 1
+            assert "Not found" in capsys.readouterr().err
+        assert self._titles(config) == ["Berserk", "86"]
+
+    def test_hash_index_selects_entry(self, run_cli, config):
+        self._seed(config, "Berserk", "86")
+        assert run_cli("set", "#2", "dropped") == 0
+        assert self._status(config, "86") == "dropped"
+        assert run_cli("rm", "#1", "--yes") == 0
+        assert self._titles(config) == ["86"]
+
+    def test_hash_index_out_of_range(self, run_cli, config, capsys):
+        self._seed(config, "Berserk")
+        capsys.readouterr()
+        assert run_cli("rm", "#5", "--yes") == 1
+        assert "Not found" in capsys.readouterr().err
+        assert self._titles(config) == ["Berserk"]
+
+    def test_check_title_runs_only_the_exact_match(self, run_cli, config,
+                                                   monkeypatch):
+        from memanga import cli
+
+        self._seed(config, "One Piece", "One Piece Colored")
+        checked = []
+        monkeypatch.setattr(cli, "check_for_updates",
+                            lambda manga, *a, **k: checked.append(manga["title"]) or [])
+        assert run_cli("check", "-t", "One Piece") == 0
+        assert checked == ["One Piece"]
+
+    def test_rm_yes_keeps_history(self, run_cli, config, cli_state):
+        from memanga.state import State
+
+        self._seed(config, "Goner")
+        cli_state.add_downloaded_chapter("Goner", "1")
+        cli_state.save()
+        assert run_cli("rm", "Goner", "--yes") == 0
+        assert self._titles(config) == []
+        fresh = State(config_dir=cli_state.state_path.parent)
+        assert fresh.get_downloaded_chapters("Goner") == ["1"]
+
+    def test_rm_purge_removes_history(self, run_cli, config, cli_state):
+        from memanga.state import State
+
+        self._seed(config, "Goner")
+        cli_state.add_downloaded_chapter("Goner", "1")
+        cli_state.save()
+        assert run_cli("rm", "Goner", "--yes", "--purge") == 0
+        assert self._titles(config) == []
+        fresh = State(config_dir=cli_state.state_path.parent)
+        assert fresh.get_downloaded_chapters("Goner") == []

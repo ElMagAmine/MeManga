@@ -35,6 +35,12 @@ All notable changes are recorded here. Format loosely follows
   existing `--yes`) to add it anyway. Exact duplicates are still refused.
   An invalid fallback delay in interactive mode asks again instead of
   crashing.
+- #237 `remove`, `set`, `update` and `check -t` no longer pick the wrong
+  manga. An exact title (any case) wins over a partial one, and a partial
+  title that matches several manga exits 1 and lists them. A bare number
+  such as `86` now matches only an exact title; use `#N` (quoted in the
+  shell) for the Nth manga in `memanga list`. `remove --yes` keeps the
+  download history; pass the new `--purge` to delete it as well.
 - #239 CLI exit codes are now predictable: 0 success, 1 error, 2 usage
   error, 3 when `check` or `failed --retry` ran but some chapters failed,
   and 130 when interrupted. `remove`, `set`, `update` and `check -t` exit

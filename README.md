@@ -284,7 +284,7 @@ For a host cron job, run Compose from the repository directory:
 | `list` (`ls`) [--json] | Show every tracked manga with status + chapter counts |
 | `add` | Add a manga; supports `-t TITLE -u URL [-b BACKUP_URL]` or `-i` interactive |
 | `set TITLE STATUS` | `reading` / `on-hold` / `dropped` / `completed` |
-| `remove TITLE` (`rm`) | Drop a manga from tracking |
+| `remove TITLE` (`rm`) [--yes] [--purge] | Drop a manga from tracking; `--purge` also deletes its download history |
 | `update TITLE …` | Edit URL, backup source, or rename |
 | `check [TITLE] [--from N] [--auto] [--safe]` | Look for new chapters, optionally download them |
 | `failed [--retry] [--clear] [--json]` | List / re-attempt / clear partially-failed downloads |
@@ -296,6 +296,8 @@ For a host cron job, run Compose from the repository directory:
 | `sources` | List all 319 supported domains, marking which ones are healthy |
 | `export FILE` / `import FILE` | Back up or restore your library + state as JSON |
 | `tui` | Launch the in-terminal interactive view |
+
+TITLE matches an exact title (any case) first, then a partial title that fits only one manga; an ambiguous partial title is refused, and a bare number must match a title exactly. Use `"#N"` to pick the Nth manga from `list`.
 
 Run any subcommand with `--help` for full flags.
 

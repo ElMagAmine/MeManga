@@ -407,11 +407,15 @@ By title:
 run remove "One Piece"
 ```
 
-By list number:
+By list number (quote it, since `#` starts a shell comment):
 
 ```bash
-run remove 1
+run remove "#1"
 ```
+
+A title that matches more than one manga is refused and the matches are
+listed, so use the full title. `--yes` skips the confirmation but keeps the
+download history; add `--purge` to remove that too.
 
 ---
 
@@ -430,7 +434,7 @@ Run `run` and select option **[4] Check Now**. The menu walks you through everyt
 │ 2 │ Solo Leveling │ reading │ mangafire.to (+1)          │
 └───┴───────────────┴─────────┴────────────────────────────┘
 
-Check which manga? (a=all, or enter # / title) [a]: a
+Check which manga? (a=all, or enter #N / title) [a]: a
 Auto-download new chapters? [Y/n]: y
 Start from chapter? (Enter for latest, or type a number):
 Output format? (Enter for default, or type pdf/epub/cbz/zip/jpg/png/webp):
@@ -460,7 +464,7 @@ run check --auto --quiet         # Quiet mode (for scripts and cron)
 Run `run`, select **[4] Check Now**, then:
 
 ```
-Check which manga? (a=all, or enter # / title) [a]: 1
+Check which manga? (a=all, or enter #N / title) [a]: #1
 Auto-download new chapters? [Y/n]: y
 Start from chapter? (Enter for latest, or type a number): 1
 Output format? (Enter for default, or type pdf/epub/cbz/zip/jpg/png/webp):
@@ -496,7 +500,7 @@ The `--safe` flag is important for bulk downloads — without it, the browser ca
 Run `run`, select **[4] Check Now**, then:
 
 ```
-Check which manga? (a=all, or enter # / title) [a]: One Piece
+Check which manga? (a=all, or enter #N / title) [a]: One Piece
 Auto-download new chapters? [Y/n]: y
 Start from chapter? (Enter for latest, or type a number): 50
 Output format? (Enter for default, or type pdf/epub/cbz/zip/jpg/png/webp):
@@ -564,10 +568,10 @@ run set "One Piece" reading
 ### Set by list number
 
 ```bash
-run set 1 on-hold
+run set "#1" on-hold
 ```
 
-You can also use partial title matching — `run set "Solo" completed` will match "Solo Leveling".
+You can also use partial title matching — `run set "Solo" completed` will match "Solo Leveling" if no other title contains "Solo".
 
 ---
 
@@ -853,7 +857,7 @@ run update "One Piece" -t "One Piece (Colored)"
 ### You can also update by list number
 
 ```bash
-run update 1 -u "https://new-source.com/one-piece"
+run update "#1" -u "https://new-source.com/one-piece"
 ```
 
 ---
