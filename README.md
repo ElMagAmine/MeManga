@@ -20,7 +20,7 @@ Works offline once chapters are downloaded.
 
 ---
 
-##  Highlights
+## Highlights
 
 - **Single-file desktop app** — `MeManga.exe` / `MeManga`
 - **Library tracking** — your read/unread state survives reboots
@@ -159,7 +159,7 @@ back up.
 The Sources page shows every supported domain with its current health
 status (latency, last successful check, last error). Toggle individual
 sources on/off; your selection persists across restarts. Websites might
-be dead and still show up in there though. Jus a little **warning**.
+be dead and still show up in there though. Just a little **warning**.
 
 <p align="center">
   <img src="docs/screenshots/sources-page.png" alt="Sources page with toggle list and health badges" width="900">
