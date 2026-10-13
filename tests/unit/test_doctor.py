@@ -344,6 +344,28 @@ class TestScheduler:
                                config_dir="/srv/My Manga/cfg")
         assert self._check(config, line + "\n").status == doctor.OK
 
+    def test_managed_entries_are_reported(self, config):
+        """#231: hand-written entries still count as installed, but only
+        the marked one is listed as managed by `cron install`."""
+        from memanga.cron import build_cron_line
+        config.set("cron.enabled", True)
+        managed = build_cron_line(0, 6, "/opt/memanga", sys.executable)
+        result = self._check(config, f"{managed}\n")
+        assert result.status == doctor.OK
+        assert result.details["managed_entries"] == [managed]
+
+        result = self._check(config, self._line())
+        assert result.status == doctor.OK
+        assert result.details["managed_entries"] == []
+
+    def test_legacy_and_managed_entries_warn(self, config):
+        from memanga.cron import build_cron_line
+        config.set("cron.enabled", True)
+        managed = build_cron_line(0, 6, "/opt/memanga", sys.executable)
+        result = self._check(config, f"{self._line()}\n{managed}\n")
+        assert result.status == doctor.WARNING
+        assert "crontab -e" in result.message
+
     def test_config_dir_equals_form_is_accepted(self, config):
         config.set("cron.enabled", True)
         line = (f"0 6 * * * {sys.executable} -m memanga "

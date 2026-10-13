@@ -918,12 +918,21 @@ class TestSearchCommand:
 # ─────────────────────────────────────────────────────────────────────────
 
 
-def _capture_crontab(monkeypatch):
-    """Fake an empty crontab on Linux; return the dict that receives the
-    text `cron install` submits under ``"crontab"``."""
+def _capture_crontab(monkeypatch, existing=None):
+    """Fake a crontab on Linux (empty, or ``existing`` text); return the
+    dict that receives the text `cron install` submits under
+    ``"crontab"`` and records a `crontab -r` under ``"removed"``."""
     from memanga import cli
 
     submitted = {}
+
+    def _run(argv, *a, **k):
+        if argv == ["crontab", "-r"]:
+            submitted["removed"] = True
+        if existing is None:
+            return types.SimpleNamespace(returncode=1, stdout="",
+                                         stderr="no crontab for tester\n")
+        return types.SimpleNamespace(returncode=0, stdout=existing, stderr="")
 
     class _FakePopen:
         returncode = 0
@@ -936,10 +945,7 @@ def _capture_crontab(monkeypatch):
             return ("", "")
 
     monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(
-        cli.subprocess, "run",
-        lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="",
-                                              stderr=""))
+    monkeypatch.setattr(cli.subprocess, "run", _run)
     monkeypatch.setattr(cli.subprocess, "Popen", _FakePopen)
     return submitted
 
@@ -990,6 +996,123 @@ class TestCronCommand:
 
         assert _expected_cron_line() in submitted["crontab"].splitlines()
         assert "--config-dir" not in submitted["crontab"]
+
+
+# Issue #231: install/remove/status only touch the marked line.
+_LEGACY_CRON = ("0 6 * * * cd /opt/memanga && /usr/bin/python3 -m memanga "
+                "check --auto --quiet >> /opt/memanga/memanga.log 2>&1")
+_DOCKER_CRON = ("0 5 * * * /usr/bin/flock -n /tmp/memanga.lock docker compose "
+                "-f /srv/memanga/compose.yaml run --rm memanga check")
+_USER_CRONTAB = (
+    "# my jobs, including memanga ones\n"
+    "MAILTO=me@example.com\n"
+    "\n"
+    "30 2 * * *  /usr/local/bin/backup.sh   # nightly\n"
+    f"{_LEGACY_CRON}\n"
+    "\n"
+    f"{_DOCKER_CRON}\n"
+)
+
+
+class TestCronOwnership:
+    def _managed(self, minute=0, hour=6):
+        from memanga.cron import build_cron_line
+        return build_cron_line(minute, hour, "/opt/memanga", "/usr/bin/python3")
+
+    def test_install_keeps_unrelated_lines(self, run_cli, monkeypatch,
+                                           isolated_home, capsys):
+        submitted = _capture_crontab(monkeypatch, _USER_CRONTAB)
+        assert run_cli("cron", "install", "--time", "06:00") == 0
+
+        expected = _expected_cron_line(isolated_home / ".config" / "memanga")
+        assert submitted["crontab"] == f"{_USER_CRONTAB}{expected}\n"
+        out = capsys.readouterr().out
+        assert "not managed" in out
+        assert "/srv/memanga/compose.yaml" in out
+
+    def test_install_replaces_only_managed_line(self, run_cli, monkeypatch,
+                                                isolated_home):
+        existing = f"{self._managed(15, 3)}\n{_USER_CRONTAB}"
+        submitted = _capture_crontab(monkeypatch, existing)
+        assert run_cli("cron", "install", "--time", "06:00") == 0
+
+        expected = _expected_cron_line(isolated_home / ".config" / "memanga")
+        assert submitted["crontab"] == f"{_USER_CRONTAB}{expected}\n"
+
+    def test_remove_drops_only_managed_line(self, run_cli, monkeypatch):
+        existing = _USER_CRONTAB.replace(
+            "\n\n", f"\n{self._managed()}\n\n", 1)
+        submitted = _capture_crontab(monkeypatch, existing)
+        assert run_cli("cron", "remove") == 0
+
+        assert submitted["crontab"] == _USER_CRONTAB
+        assert "removed" not in submitted
+
+    def test_remove_without_managed_line_leaves_crontab(self, run_cli,
+                                                        monkeypatch, capsys):
+        """Blank lines and unmarked MeManga lines must not count as a
+        managed job, so nothing is rewritten or deleted."""
+        submitted = _capture_crontab(monkeypatch, _USER_CRONTAB)
+        assert run_cli("cron", "remove") == 0
+
+        assert submitted == {}
+        assert "No MeManga cron job found" in capsys.readouterr().out
+
+    def test_remove_last_managed_line_deletes_crontab(self, run_cli,
+                                                      monkeypatch):
+        submitted = _capture_crontab(monkeypatch, f"\n{self._managed()}\n")
+        assert run_cli("cron", "remove") == 0
+        assert submitted == {"removed": True}
+
+    def test_status_ignores_unmarked_lines(self, run_cli, monkeypatch, capsys):
+        _capture_crontab(monkeypatch, _USER_CRONTAB)
+        run_cli("cron", "status")
+        out = capsys.readouterr().out
+        assert "No cron job found" in out
+        assert "Cron job is installed" not in out
+        assert "not managed" in out
+
+    def test_install_refuses_unreadable_crontab(self, run_cli, monkeypatch,
+                                                config, capsys):
+        """A `crontab -l` failure other than "no crontab" must not lead to
+        overwriting the user's crontab."""
+        from memanga import cli
+
+        submitted = _capture_crontab(monkeypatch)
+        monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: types.SimpleNamespace(
+            returncode=1, stdout="", stderr="crontab: Permission denied\n"))
+        assert run_cli("cron", "install", "--time", "06:00") == 1
+
+        assert submitted == {}
+        assert not config.get("cron.enabled")
+        assert "Could not read" in capsys.readouterr().err
+
+    def test_remove_write_failure_keeps_config(self, run_cli, monkeypatch,
+                                               config):
+        from memanga import cli
+
+        config.set("cron.enabled", True)
+        config.save()
+        submitted = _capture_crontab(monkeypatch, f"{_USER_CRONTAB}{self._managed()}\n")
+
+        class _FailingPopen:
+            returncode = 1
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def communicate(self, input=None):
+                submitted["crontab"] = input
+                return ("", "")
+
+        monkeypatch.setattr(cli.subprocess, "Popen", _FailingPopen)
+        assert run_cli("cron", "remove") == 1
+        assert config.get("cron.enabled") is True
+
+    def test_status_reports_managed_line(self, run_cli, monkeypatch, capsys):
+        _capture_crontab(monkeypatch, f"{_USER_CRONTAB}{self._managed()}\n")
+        run_cli("cron", "status")
+        assert "Cron job is installed" in capsys.readouterr().out
 
 
 # ─────────────────────────────────────────────────────────────────────────

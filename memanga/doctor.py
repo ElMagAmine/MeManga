@@ -34,6 +34,7 @@ import yaml
 
 from . import __version__
 from .config import get_app_password
+from .cron import is_managed_line
 
 SCHEMA_VERSION = 1
 
@@ -518,6 +519,10 @@ def check_scheduler(config, state=None, runner: Callable = subprocess.run,
             entries = [line for line in text.splitlines()
                        if "memanga" in line.lower() and not line.lstrip().startswith("#")]
             details["entries"] = entries
+            # Issue #231: hand-written entries still schedule checks, so
+            # they count as installed; only marked ones belong to
+            # `cron install`, which leaves the others alone.
+            details["managed_entries"] = [e for e in entries if is_managed_line(e)]
             installed = bool(entries)
             entries_ok = len(entries) <= 1 and all(_cron_entry_sane(e) for e in entries)
     details["installed"] = installed
@@ -539,7 +544,8 @@ def check_scheduler(config, state=None, runner: Callable = subprocess.run,
     if installed and not entries_ok:
         return CheckResult("scheduler", WARNING,
                            "MeManga crontab entries look wrong (duplicate, unexpected command, "
-                           "or missing interpreter); reinstall with 'memanga cron install'", details)
+                           "or missing interpreter); reinstall with 'memanga cron install' "
+                           "and edit hand-written entries with 'crontab -e'", details)
     if installed:
         return CheckResult("scheduler", OK, f"Daily check scheduled at {cron_time}", details)
     return CheckResult("scheduler", OK, "No scheduled checks configured", details)
