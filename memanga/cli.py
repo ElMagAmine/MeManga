@@ -18,7 +18,7 @@ from typing import Dict, Any, Optional
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Prompt, Confirm, IntPrompt
 from rich.table import Table
 from rich import box
 
@@ -249,6 +249,15 @@ def cmd_list(args):
     console.print(table)
 
 
+def _ask_fallback_days() -> int:
+    """Prompt until the fallback delay is a whole number of days >= 0."""
+    while True:
+        days = IntPrompt.ask("⏱️  Fallback delay (days)", default=2)
+        if days >= 0:
+            return days
+        console.print("[prompt.invalid]Please enter 0 or more days")
+
+
 def cmd_add(args):
     """Add a manga to track."""
     from urllib.parse import urlparse
@@ -256,11 +265,13 @@ def cmd_add(args):
     backup_url = None
     fallback_days = 2
     
-    assume_yes = getattr(args, 'yes', False)
-    interactive = _stdin_is_tty()
+    # Issue #238: flag-driven `add` never prompts; --force (alias --yes)
+    # accepts an unsupported source or a similar title deliberately.
+    force = getattr(args, 'force', False) or getattr(args, 'yes', False)
+    can_prompt = bool(args.interactive)
 
     if args.interactive:
-        if not interactive:
+        if not _stdin_is_tty():
             return _non_interactive_error(
                 "add --interactive needs a terminal; pass --title and --url instead"
             )
@@ -282,7 +293,7 @@ def cmd_add(args):
         if Confirm.ask("Add a backup source?", default=False):
             backup_url = Prompt.ask("🔗 Backup source URL (e.g., MangaDex)")
             if backup_url:
-                fallback_days = int(Prompt.ask("⏱️  Fallback delay (days)", default="2"))
+                fallback_days = _ask_fallback_days()
     else:
         title = args.title
         url = args.url
@@ -307,10 +318,10 @@ def cmd_add(args):
     if not source_ok:
         console.print(f"[yellow]⚠️  Warning:[/yellow] '{_esc(source)}' might not be supported.")
         console.print(f"[dim]Supported: {_esc(', '.join(supported))}[/dim]")
-        if not assume_yes:
-            if not interactive:
+        if not force:
+            if not can_prompt:
                 return _non_interactive_error(
-                    f"'{source}' might not be supported; pass --yes to add it anyway"
+                    f"'{source}' might not be supported; pass --force to add it anyway"
                 )
             if not Confirm.ask("Add anyway?"):
                 return
@@ -358,10 +369,10 @@ def cmd_add(args):
         existing_lower = m["title"].lower()
         if (new_lower in existing_lower or existing_lower in new_lower) and new_lower != existing_lower:
             console.print(f"[yellow]⚠️  Similar manga already tracked: [cyan]{_esc(m['title'])}[/cyan][/yellow]")
-            if not assume_yes:
-                if not interactive:
+            if not force:
+                if not can_prompt:
                     return _non_interactive_error(
-                        f"similar manga already tracked: '{m['title']}'; pass --yes to add anyway"
+                        f"similar manga already tracked: '{m['title']}'; pass --force to add anyway"
                     )
                 if not Confirm.ask("Add anyway?", default=False):
                     return
@@ -2126,7 +2137,8 @@ Examples:
     p_add.add_argument("-b", "--backup", help="Backup source URL")
     p_add.add_argument("--fallback-days", type=int, default=2, help="Days to wait before using backup (default: 2)")
     p_add.add_argument("-i", "--interactive", action="store_true", help="Interactive mode")
-    p_add.add_argument("-y", "--yes", action="store_true", help="Add without confirming unsupported sources or similar titles")
+    p_add.add_argument("-f", "--force", "-y", "--yes", dest="force", action="store_true",
+                       help="Add even if the source might be unsupported or a similar title is tracked")
     p_add.set_defaults(func=cmd_add)
     
     # set (change manga status)
