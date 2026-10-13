@@ -368,6 +368,10 @@ then print a single JSON document to stdout with no other output.
 removed or change type. `failed --json` only lists; it cannot be
 combined with `--retry` or `--clear`.
 
+Command results and JSON go to stdout; errors and warnings go to
+stderr. Exit codes are listed in
+[the Guide](docs/Guide.md#exit-codes).
+
 ```bash
 python -m memanga failed --json | jq -r '.chapters[] | "\(.title) #\(.chapter)"'
 python -m memanga doctor --json --check browsers --launch-browsers

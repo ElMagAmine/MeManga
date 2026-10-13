@@ -37,6 +37,16 @@ from .search import compute_search_sources, probe_chapter_counts, sweep
 from .emailer import send_to_kindle, EmailError
 
 console = Console()
+# Issue #239: diagnostics (errors, refused or degraded work) go to stderr
+# so stdout carries only command results.
+err_console = Console(stderr=True)
+
+# Issue #239: CLI exit codes.
+EXIT_OK = 0
+EXIT_ERROR = 1          # operational error: not found, invalid input, refused
+EXIT_USAGE = 2          # usage error (raised by argparse itself)
+EXIT_PARTIAL = 3        # check / failed --retry ran but some chapters failed
+EXIT_INTERRUPTED = 130  # Ctrl-C
 
 
 def _esc(value) -> str:
@@ -60,7 +70,13 @@ def _stdin_is_tty() -> bool:
 def _non_interactive_error(message: str) -> int:
     """Report input a non-interactive run can't supply; return exit code 1."""
     sys.stderr.write(f"error: {message}\n")
-    return 1
+    return EXIT_ERROR
+
+
+def _error(message: str) -> int:
+    """Print a Rich-markup diagnostic to stderr; return EXIT_ERROR."""
+    err_console.print(message)
+    return EXIT_ERROR
 
 # Issue #221: `--config-dir DIR` wins over $MEMANGA_CONFIG_DIR, which
 # wins over the default ~/.config/memanga.
@@ -303,8 +319,7 @@ def cmd_add(args):
             fallback_days = 2
         
         if not title or not url:
-            console.print("[red]Error:[/red] --title and --url required (or use --interactive)")
-            return 1
+            return _error("[red]Error:[/red] --title and --url required (or use --interactive)")
     
     # Extract source from URL
     parsed = urlparse(url)
@@ -316,8 +331,8 @@ def cmd_add(args):
     supported = get_supported_sources()
     source_ok = any(source == s or source.endswith("." + s) for s in supported)
     if not source_ok:
-        console.print(f"[yellow]⚠️  Warning:[/yellow] '{_esc(source)}' might not be supported.")
-        console.print(f"[dim]Supported: {_esc(', '.join(supported))}[/dim]")
+        err_console.print(f"[yellow]⚠️  Warning:[/yellow] '{_esc(source)}' might not be supported.")
+        err_console.print(f"[dim]Supported: {_esc(', '.join(supported))}[/dim]")
         if not force:
             if not can_prompt:
                 return _non_interactive_error(
@@ -360,7 +375,7 @@ def cmd_add(args):
     # Check for exact duplicate
     for m in manga_list:
         if m["title"].lower() == title.lower():
-            console.print(f"[yellow]⚠️  '{_esc(title)}' already exists![/yellow]")
+            err_console.print(f"[yellow]⚠️  '{_esc(title)}' already exists![/yellow]")
             return
 
     # Check for similar titles (substring match)
@@ -368,7 +383,7 @@ def cmd_add(args):
     for m in manga_list:
         existing_lower = m["title"].lower()
         if (new_lower in existing_lower or existing_lower in new_lower) and new_lower != existing_lower:
-            console.print(f"[yellow]⚠️  Similar manga already tracked: [cyan]{_esc(m['title'])}[/cyan][/yellow]")
+            err_console.print(f"[yellow]⚠️  Similar manga already tracked: [cyan]{_esc(m['title'])}[/cyan][/yellow]")
             if not force:
                 if not can_prompt:
                     return _non_interactive_error(
@@ -409,15 +424,14 @@ def cmd_remove(args):
     manga_list = config.get("manga", [])
 
     if not manga_list:
-        console.print("[yellow]No manga to remove.[/yellow]")
-        return
+        return _error("[yellow]No manga to remove.[/yellow]")
 
     found, found_idx = _find_manga(args.target, manga_list)
 
     if not found:
-        console.print(f"[red]Not found:[/red] {_esc(args.target)}")
-        console.print("[dim]Use 'memanga list' to see tracked manga.[/dim]")
-        return
+        err_console.print(f"[red]Not found:[/red] {_esc(args.target)}")
+        err_console.print("[dim]Use 'memanga list' to see tracked manga.[/dim]")
+        return EXIT_ERROR
 
     if not args.yes and not _stdin_is_tty():
         return _non_interactive_error(
@@ -444,21 +458,19 @@ def cmd_set_status(args):
     manga_list = config.get("manga", [])
     
     if not manga_list:
-        console.print("[yellow]No manga tracked.[/yellow]")
-        return
+        return _error("[yellow]No manga tracked.[/yellow]")
     
     new_status = args.status.lower()
 
     if new_status not in VALID_STATUSES:
-        console.print(f"[red]Invalid status:[/red] {_esc(new_status)}")
-        console.print(f"[dim]Valid: {', '.join(VALID_STATUSES)}[/dim]")
-        return
+        err_console.print(f"[red]Invalid status:[/red] {_esc(new_status)}")
+        err_console.print(f"[dim]Valid: {', '.join(VALID_STATUSES)}[/dim]")
+        return EXIT_ERROR
 
     found, found_idx = _find_manga(args.target, manga_list)
 
     if not found:
-        console.print(f"[red]Not found:[/red] {_esc(args.target)}")
-        return
+        return _error(f"[red]Not found:[/red] {_esc(args.target)}")
 
     old_status = found.get("status", "reading")
     manga_list[found_idx]["status"] = new_status
@@ -483,15 +495,14 @@ def cmd_update(args):
     manga_list = config.get("manga", [])
 
     if not manga_list:
-        console.print("[yellow]No manga tracked.[/yellow]")
-        return
+        return _error("[yellow]No manga tracked.[/yellow]")
 
     found, found_idx = _find_manga(args.target, manga_list)
 
     if not found:
-        console.print(f"[red]Not found:[/red] {_esc(args.target)}")
-        console.print("[dim]Use 'memanga list' to see tracked manga.[/dim]")
-        return
+        err_console.print(f"[red]Not found:[/red] {_esc(args.target)}")
+        err_console.print("[dim]Use 'memanga list' to see tracked manga.[/dim]")
+        return EXIT_ERROR
 
     old_title = found["title"]
     changes = []
@@ -543,8 +554,7 @@ def cmd_update(args):
         changes.append(f"Title → {args.title}")
 
     if not changes:
-        console.print("[yellow]No changes specified. Use --url, --backup, or --title.[/yellow]")
-        return
+        return _error("[yellow]No changes specified. Use --url, --backup, or --title.[/yellow]")
 
     manga_list[found_idx] = found
     config.set("manga", manga_list)
@@ -559,7 +569,7 @@ def cmd_check(args):
     """Check for new chapters and download."""
     manga_list = config.get("manga", [])
     
-    if not manga_list:
+    if not manga_list and not args.title:
         console.print("[yellow]No manga tracked. Use 'memanga add' first![/yellow]")
         return
     
@@ -567,8 +577,7 @@ def cmd_check(args):
     if args.title:
         manga_list = [m for m in manga_list if args.title.lower() in m["title"].lower()]
         if not manga_list:
-            console.print(f"[red]Not found:[/red] {_esc(args.title)}")
-            return
+            return _error(f"[red]Not found:[/red] {_esc(args.title)}")
     
     from_chapter = getattr(args, 'from_chapter', None)
     if getattr(args, 'all', False):
@@ -590,6 +599,9 @@ def cmd_check(args):
     total_new = 0
     total_downloaded = 0
     total_failed = 0
+    # Manga checked, and those whose check itself errored (#239).
+    total_checked = 0
+    total_errored = 0
     # Chapters left undownloaded because no one could confirm them (#258).
     total_unconfirmed = 0
     interactive = _stdin_is_tty()
@@ -621,6 +633,7 @@ def cmd_check(args):
             continue
         
         console.print(f"[dim]Checking:[/dim] [cyan]{_esc(title)}[/cyan]...")
+        total_checked += 1
         
         try:
             force_suspicious = getattr(args, 'force_suspicious', False)
@@ -634,16 +647,16 @@ def cmd_check(args):
             # because it couldn't be confirmed by a backup source.
             suspicious = state.get_suspicious_batch(title) if from_chapter is None else None
             if suspicious:
-                console.print(
+                err_console.print(
                     f"  [yellow]└─ Warning: Suspicious chapter batch detected: "
                     f"{_esc(suspicious.get('count'))} chapter(s) up to "
                     f"{_esc(suspicious.get('highest'))} "
                     f"(last tracked: {_esc(suspicious.get('last_chapter'))})[/yellow]"
                 )
                 for reason in suspicious.get("reasons", []):
-                    console.print(f"     [dim]- {_esc(reason)}[/dim]")
-                console.print(f"     [dim]- {_esc(suspicious.get('backup_status'))}[/dim]")
-                console.print(
+                    err_console.print(f"     [dim]- {_esc(reason)}[/dim]")
+                err_console.print(f"     [dim]- {_esc(suspicious.get('backup_status'))}[/dim]")
+                err_console.print(
                     "     [yellow]Skipped auto-delivery. Run "
                     "'memanga check --force-suspicious' to accept anyway.[/yellow]"
                 )
@@ -717,7 +730,7 @@ def cmd_check(args):
                             file_path.unlink()
                             console.print("     [dim]🗑️  Deleted local copy[/dim]")
                     except EmailError as email_e:
-                        console.print(f"     [red]📧 Email failed: {_esc(email_e)}[/red]")
+                        err_console.print(f"     [red]📧 Email failed: {_esc(email_e)}[/red]")
 
                 def _announce_saved(file_path, from_backup, partial, source=None):
                     """Print the save line and, for partials, warn + log which
@@ -727,7 +740,7 @@ def cmd_check(args):
                     if partial:
                         miss = partial.get("failed_pages", [])
                         total = partial.get("total", 0)
-                        console.print(
+                        err_console.print(
                             f"     [yellow]⚠️  Saved partial{src}: {label} — "
                             f"{len(miss)}/{total} page(s) missing (pages {_esc(miss)})[/yellow]"
                         )
@@ -805,7 +818,7 @@ def cmd_check(args):
 
                     # 1) Try a complete download from the backup source.
                     if backup_ch:
-                        console.print(f"     [yellow]⚠️  Primary failed ({_esc(e)}), trying backup ({_esc(backup_ch.source)})...[/yellow]")
+                        err_console.print(f"     [yellow]⚠️  Primary failed ({_esc(e)}), trying backup ({_esc(backup_ch.source)})...[/yellow]")
                         try:
                             file_path = download_chapter(
                                 manga, backup_ch, download_dir, output_format,
@@ -826,7 +839,7 @@ def cmd_check(args):
                             saved = True
                         except DownloaderError as be:
                             backup_e = be
-                            console.print(f"     [red]❌ Backup also failed: {_esc(be)}[/red]")
+                            err_console.print(f"     [red]❌ Backup also failed: {_esc(be)}[/red]")
 
                     # 2) Both sources failed to deliver a complete chapter.
                     #    If partial tolerance is on, salvage the best partial
@@ -869,7 +882,7 @@ def cmd_check(args):
                     # 3) Nothing worked — record the failure.
                     if not saved:
                         if backup_ch and backup_e is not None:
-                            console.print(f"     [red]❌ Failed: {_esc(e)}[/red]")
+                            err_console.print(f"     [red]❌ Failed: {_esc(e)}[/red]")
                             state.add_failed_chapter(
                                 title, ch.number,
                                 f"{ch_source}+{backup_ch.source}",
@@ -877,7 +890,7 @@ def cmd_check(args):
                                 failed_pages=getattr(e, "failed_pages", None),
                             )
                         else:
-                            console.print(f"     [red]❌ Failed: {_esc(e)}[/red]")
+                            err_console.print(f"     [red]❌ Failed: {_esc(e)}[/red]")
                             state.add_failed_chapter(
                                 title, ch.number, ch_source, str(e),
                                 failed_pages=getattr(e, "failed_pages", None),
@@ -885,9 +898,11 @@ def cmd_check(args):
                         total_failed += 1
 
         except DownloaderError as e:
-            console.print(f"  [red]└─ Error: {_esc(e)}[/red]")
+            err_console.print(f"  [red]└─ Error: {_esc(e)}[/red]")
+            total_errored += 1
         except Exception as e:
-            console.print(f"  [red]└─ Unexpected error: {_esc(e)}[/red]")
+            err_console.print(f"  [red]└─ Unexpected error: {_esc(e)}[/red]")
+            total_errored += 1
     
     # Record check history with actual counts
     state.update_last_check(new_chapters=total_new, downloaded=total_downloaded)
@@ -903,12 +918,20 @@ def cmd_check(args):
         if delivery_mode == "local":
             console.print(f"[dim]📁 Downloads: {_esc(download_dir)}[/dim]")
     if total_failed > 0:
-        console.print(f"[yellow]⚠️  {total_failed} chapter(s) failed — run 'memanga failed' for details.[/yellow]")
+        err_console.print(f"[yellow]⚠️  {total_failed} chapter(s) failed — run 'memanga failed' for details.[/yellow]")
+    if total_errored:
+        err_console.print(f"[yellow]⚠️  {total_errored}/{total_checked} manga could not be checked.[/yellow]")
     if total_unconfirmed:
         return _non_interactive_error(
             f"skipped {total_unconfirmed} chapter(s) that need confirmation; "
             "pass --auto or --yes to download without prompting"
         )
+    # Issue #239: nothing could be checked is an error; some chapters or
+    # manga failing while the rest ran is a partial failure.
+    if total_checked and total_errored == total_checked:
+        return EXIT_ERROR
+    if total_failed or total_errored:
+        return EXIT_PARTIAL
 
 
 def _status_payload() -> Dict[str, Any]:
@@ -1228,8 +1251,7 @@ def _cmd_cron_unix(args):
             hour, minute = time_str.split(":")
             hour, minute = int(hour), int(minute)
         except ValueError:
-            console.print("[red]Invalid time format. Use HH:MM[/red]")
-            return 1
+            return _error("[red]Invalid time format. Use HH:MM[/red]")
 
         cron_line = build_cron_line(minute, hour, project_dir, python_path,
                                     config_dir=_context.config_dir)
@@ -1256,8 +1278,7 @@ def _cmd_cron_unix(args):
             console.print(f"[green]✅ Cron job installed! Will check daily at {time_str}[/green]")
             console.print(f"[dim]{_esc(cron_line)}[/dim]")
         else:
-            console.print("[red]Failed to install cron job[/red]")
-            return 1
+            return _error("[red]Failed to install cron job[/red]")
 
     elif args.action == "remove":
         result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
@@ -1321,8 +1342,7 @@ def _cmd_cron_windows(args):
             hour, minute = time_str.split(":")
             int(hour), int(minute)
         except ValueError:
-            console.print("[red]Invalid time format. Use HH:MM[/red]")
-            return 1
+            return _error("[red]Invalid time format. Use HH:MM[/red]")
 
         # Delete existing task if present
         subprocess.run(
@@ -1352,8 +1372,7 @@ def _cmd_cron_windows(args):
             config.save()
             console.print(f"[green]✅ Scheduled task installed! Will check daily at {time_str}[/green]")
         else:
-            console.print(f"[red]Failed to create scheduled task: {_esc(result.stderr.strip())}[/red]")
-            return 1
+            return _error(f"[red]Failed to create scheduled task: {_esc(result.stderr.strip())}[/red]")
 
     elif args.action == "remove":
         result = subprocess.run(
@@ -1423,11 +1442,9 @@ def cmd_search(args):
     """Search enabled sources for a manga by title."""
     query = args.query.strip()
     if not query:
-        console.print("[red]Error:[/red] empty search query")
-        return 1
+        return _error("[red]Error:[/red] empty search query")
     if args.limit is not None and args.limit < 1:
-        console.print("[red]Error:[/red] --limit must be at least 1")
-        return 1
+        return _error("[red]Error:[/red] --limit must be at least 1")
 
     # Resolve the source list: one source with --source, otherwise the
     # same enabled-aggregators + library sweep the GUI Search page runs.
@@ -1438,16 +1455,15 @@ def cmd_search(args):
         try:
             get_scraper(source)
         except ValueError:
-            console.print(f"[red]Unknown source:[/red] {_esc(source)}")
-            console.print("[dim]Use 'memanga sources' to see supported sources.[/dim]")
-            return 1
+            err_console.print(f"[red]Unknown source:[/red] {_esc(source)}")
+            err_console.print("[dim]Use 'memanga sources' to see supported sources.[/dim]")
+            return EXIT_ERROR
         sources = [source]
     else:
         sources = compute_search_sources(config)
 
     if not sources:
-        console.print("[yellow]No searchable sources enabled.[/yellow]")
-        return 1
+        return _error("[yellow]No searchable sources enabled.[/yellow]")
 
     quiet = args.json  # keep stdout machine-readable for --json
 
@@ -1517,9 +1533,9 @@ def cmd_search(args):
         summary += f" · {len(failures)} failed ({first.source}: {first.error})"
 
     if not results:
-        console.print(f"[yellow]No results for \"{_esc(query)}\".[/yellow]")
-        console.print(f"[dim]{_esc(summary)}[/dim]")
-        return 1
+        err_console.print(f"[yellow]No results for \"{_esc(query)}\".[/yellow]")
+        err_console.print(f"[dim]{_esc(summary)}[/dim]")
+        return EXIT_ERROR
 
     table = Table(box=box.SIMPLE)
     table.add_column("#", style="dim", justify="right")
@@ -1539,14 +1555,12 @@ def cmd_search(args):
     # ── Selection ──
     if args.add is not None:
         if not (1 <= args.add <= len(results)):
-            console.print(f"[red]Invalid result number:[/red] {args.add} (valid: 1-{len(results)})")
-            return 1
+            return _error(f"[red]Invalid result number:[/red] {args.add} (valid: 1-{len(results)})")
         ok, message = _add_search_result(results[args.add - 1], args.status)
         if ok:
             console.print(f"[green]✅ {_esc(message)}[/green]")
             return 0
-        console.print(f"[yellow]⚠️  {_esc(message)}[/yellow]")
-        return 1
+        return _error(f"[yellow]⚠️  {_esc(message)}[/yellow]")
 
     # Interactive prompt — only when someone is actually at the
     # terminal. Piped/cron invocations just get the table.
@@ -1564,17 +1578,14 @@ def cmd_search(args):
     try:
         n = int(choice)
     except ValueError:
-        console.print(f"[red]Not a result number:[/red] {_esc(choice)}")
-        return 1
+        return _error(f"[red]Not a result number:[/red] {_esc(choice)}")
     if not (1 <= n <= len(results)):
-        console.print(f"[red]Invalid result number:[/red] {n} (valid: 1-{len(results)})")
-        return 1
+        return _error(f"[red]Invalid result number:[/red] {n} (valid: 1-{len(results)})")
     ok, message = _add_search_result(results[n - 1], args.status)
     if ok:
         console.print(f"[green]✅ {_esc(message)}[/green]")
         return 0
-    console.print(f"[yellow]⚠️  {_esc(message)}[/yellow]")
-    return 1
+    return _error(f"[yellow]⚠️  {_esc(message)}[/yellow]")
 
 
 def cmd_export(args):
@@ -1603,8 +1614,7 @@ def cmd_import(args):
     import_path = Path(args.file)
 
     if not import_path.exists():
-        console.print(f"[red]File not found:[/red] {_esc(import_path)}")
-        return 1
+        return _error(f"[red]File not found:[/red] {_esc(import_path)}")
 
     with open(import_path, "r") as f:
         import_data = json.load(f)
@@ -1612,12 +1622,10 @@ def cmd_import(args):
     try:
         import_data = validate_backup(import_data)
     except BackupVersionError as exc:
-        console.print(f"[red]Cannot import:[/red] {_esc(exc)}")
-        return 1
+        return _error(f"[red]Cannot import:[/red] {_esc(exc)}")
 
     if "manga" not in import_data:
-        console.print("[red]Invalid export file (missing 'manga' key)[/red]")
-        return 1
+        return _error("[red]Invalid export file (missing 'manga' key)[/red]")
 
     imported_manga = import_data["manga"]
     imported_state = import_data.get("state", {})
@@ -1805,12 +1813,16 @@ def cmd_failed(args):
         for manga_title, chapters in retryable.items():
             manga = manga_by_title.get(manga_title)
             if not manga:
-                console.print(f"  [yellow]⚠️  Manga not found in config: {_esc(manga_title)}[/yellow]")
+                err_console.print(f"  [yellow]⚠️  Manga not found in config: {_esc(manga_title)}[/yellow]")
+                # Unretryable records still count as unrecovered (#239).
+                retried += len(chapters)
                 continue
 
             for chapter_num, info in sorted(chapters.items(), key=_chapter_order):
                 sources = _get_sources_from_manga(manga)
                 if not sources:
+                    err_console.print(f"  [yellow]⚠️  No source to retry Chapter {_esc(chapter_num)} of {_esc(manga_title)}[/yellow]")
+                    retried += 1
                     continue
 
                 # Build a minimal Chapter object from primary source
@@ -1823,11 +1835,11 @@ def cmd_failed(args):
                     ch_obj = None
 
                 if not ch_obj:
-                    console.print(f"  [yellow]⚠️  Could not find Chapter {_esc(chapter_num)} of {_esc(manga_title)} on primary source[/yellow]")
+                    err_console.print(f"  [yellow]⚠️  Could not find Chapter {_esc(chapter_num)} of {_esc(manga_title)} on primary source[/yellow]")
                     # Try backup directly
                     ch_obj = _find_chapter_on_backup(manga, chapter_num)
                     if not ch_obj:
-                        console.print(f"  [red]❌ Chapter {_esc(chapter_num)} not found on any source[/red]")
+                        err_console.print(f"  [red]❌ Chapter {_esc(chapter_num)} not found on any source[/red]")
                         retried += 1
                         continue
                 else:
@@ -1855,7 +1867,7 @@ def cmd_failed(args):
                             )
                             console.print(f"  [green]📬 Sent to Kindle![/green]")
                         except EmailError as email_e:
-                            console.print(f"  [red]📧 Email failed: {_esc(email_e)}[/red]")
+                            err_console.print(f"  [red]📧 Email failed: {_esc(email_e)}[/red]")
 
                     state.add_downloaded_chapter(manga_title, chapter_num)
                     state.clear_failed_chapter(manga_title, chapter_num)
@@ -1865,7 +1877,7 @@ def cmd_failed(args):
                     # Try backup if available
                     backup_ch = _find_chapter_on_backup(manga, chapter_num)
                     if backup_ch:
-                        console.print(f"  [yellow]⚠️  Primary failed, trying backup ({_esc(backup_ch.source)})...[/yellow]")
+                        err_console.print(f"  [yellow]⚠️  Primary failed, trying backup ({_esc(backup_ch.source)})...[/yellow]")
                         try:
                             file_path = download_chapter(manga, backup_ch, download_dir, output_format, post_processing=post_processing)
                             state.add_downloaded_chapter(manga_title, chapter_num)
@@ -1878,10 +1890,12 @@ def cmd_failed(args):
                         except DownloaderError:
                             pass
                     state.add_failed_chapter(manga_title, chapter_num, info.get("source", "?"), str(retry_e))
-                    console.print(f"  [red]❌ Still failing: {_esc(retry_e)}[/red]")
+                    err_console.print(f"  [red]❌ Still failing: {_esc(retry_e)}[/red]")
 
         console.print()
         console.print(f"[green]📊 Retry summary: {succeeded}/{retried} chapters recovered[/green]")
+        if succeeded < retried:
+            return EXIT_PARTIAL
 
 
 _DOCTOR_ICONS = {
@@ -2087,6 +2101,16 @@ def cmd_tui(args):
 # ============================================================================
 
 def main():
+    # Issue #239: handled here, not under __main__, so `python -m memanga`
+    # and the installed `memanga` script also exit 130 without a traceback.
+    try:
+        _main()
+    except KeyboardInterrupt:
+        err_console.print("\n[dim]Interrupted.[/dim]")
+        sys.exit(EXIT_INTERRUPTED)
+
+
+def _main():
     _cli_only = bool(os.environ.get("MEMANGA_CLI_ONLY"))
 
     _epilog = """
@@ -2313,8 +2337,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        console.print("\n[dim]Interrupted.[/dim]")
-        sys.exit(1)
+    main()

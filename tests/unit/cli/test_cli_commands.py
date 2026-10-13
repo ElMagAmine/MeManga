@@ -151,10 +151,15 @@ class TestRemoveCommand:
         titles = [m["title"] for m in config.get("manga", []) or []]
         assert "Goner" not in titles
 
-    def test_remove_unknown_is_noop(self, run_cli, config):
+    def test_remove_unknown_fails(self, run_cli, config, capsys):
+        # Issue #239: not found is an error, reported on stderr.
+        config.set("manga", [{"title": "Kept", "url": "u",
+                              "source": "mangadex.org",
+                              "status": "reading"}])
+        config.save()
         rc = run_cli("remove", "never-added", "--yes")
-        # Either succeeds with "not found" or errors — both acceptable
-        assert rc in (0, 1, 2)
+        assert rc == 1
+        assert "Not found" in capsys.readouterr().err
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -184,10 +189,10 @@ class TestUpdateCommand:
                               "source": "mangadex.org",
                               "status": "reading"}])
         config.save()
-        rc = run_cli("update", "Old Title", "--new-title", "New Title")
-        if rc == 0:
-            titles = [m["title"] for m in config.get("manga", []) or []]
-            assert "New Title" in titles
+        rc = run_cli("update", "Old Title", "--title", "New Title")
+        assert rc == 0
+        titles = [m["title"] for m in config.get("manga", []) or []]
+        assert "New Title" in titles
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -391,7 +396,7 @@ class TestCheckCommand:
 
         rc = run_cli("check", "--auto", "--quiet")
 
-        assert rc == 0
+        assert rc == cli.EXIT_PARTIAL
         assert not cli.state.is_chapter_downloaded("Vinland Saga", "71")
         failed = cli.state.get_failed_chapters("Vinland Saga")
         assert "71" in failed
@@ -713,7 +718,7 @@ class TestExportImport:
         capsys.readouterr()
         rc = run_cli("import", str(backup))
         assert rc == 1
-        assert "version" in capsys.readouterr().out.lower()
+        assert "version" in capsys.readouterr().err.lower()
         titles = [m["title"] for m in config.get("manga", []) or []]
         assert "Sneaky" not in titles
 
@@ -724,7 +729,7 @@ class TestExportImport:
         capsys.readouterr()
         rc = run_cli("import", str(backup))
         assert rc == 1
-        assert "newer" in capsys.readouterr().out.lower()
+        assert "newer" in capsys.readouterr().err.lower()
 
     def test_import_malformed_version_rejected(self, run_cli, config,
                                                tmp_path, capsys):
@@ -733,7 +738,7 @@ class TestExportImport:
         capsys.readouterr()
         rc = run_cli("import", str(backup))
         assert rc == 1
-        assert "version" in capsys.readouterr().out.lower()
+        assert "version" in capsys.readouterr().err.lower()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -865,7 +870,7 @@ class TestSearchCommand:
         rc = run_cli("search", "Blue Lock", "--source", "fake.test",
                      "--no-chips")
         assert rc == 1
-        assert "No results" in capsys.readouterr().out
+        assert "No results" in capsys.readouterr().err
 
     def test_source_failure_reported(self, run_cli, fake_search_scraper,
                                      capsys):
@@ -874,15 +879,15 @@ class TestSearchCommand:
         rc = run_cli("search", "Blue Lock", "--source", "fake.test",
                      "--no-chips")
         assert rc == 1
-        out = capsys.readouterr().out
-        assert "1 failed" in out
-        assert "HTTP 502" in out
+        err = capsys.readouterr().err
+        assert "1 failed" in err
+        assert "HTTP 502" in err
 
     def test_unknown_source_errors(self, run_cli, isolated_home, capsys):
         rc = run_cli("search", "Blue Lock",
                      "--source", "not-a-real-source.example")
         assert rc == 1
-        assert "Unknown source" in capsys.readouterr().out
+        assert "Unknown source" in capsys.readouterr().err
 
     def test_irrelevant_results_filtered(self, run_cli, fake_search_scraper,
                                          capsys):
@@ -1350,6 +1355,7 @@ class TestRichMarkupEscaping:
         from rich.console import Console
         from memanga import cli
         monkeypatch.setattr(cli, "console", Console(width=250))
+        monkeypatch.setattr(cli, "err_console", Console(width=250, stderr=True))
 
     def _seed(self, config, *entries):
         config.set("manga", [
@@ -1399,9 +1405,10 @@ class TestRichMarkupEscaping:
         monkeypatch.setattr(cli, "check_for_updates", _boom)
         capsys.readouterr()
 
-        assert run_cli("check", "--dry-run") == 0
-        out = capsys.readouterr().out
-        assert "Error: HTTP 403 [/forbidden] at [red]edge" in out
+        # The only manga errored, so nothing was checked (#239).
+        assert run_cli("check", "--dry-run") == 1
+        err = capsys.readouterr().err
+        assert "Error: HTTP 403 [/forbidden] at [red]edge" in err
 
     def test_failed_renders_bracketed_title_and_error(self, run_cli, config,
                                                      cli_state, capsys):
@@ -1495,7 +1502,7 @@ class TestNonInteractive:
         run_cli("add", "--title", "one piece", "--force",
                 "--url", "https://mangadex.org/title/z/x")
         assert self._titles(config) == ["One Piece"]
-        assert "already exists" in capsys.readouterr().out
+        assert "already exists" in capsys.readouterr().err
 
     def test_add_interactive_flag_fails(self, run_cli, capsys):
         assert run_cli("add", "--interactive") == 1
@@ -1673,3 +1680,217 @@ class TestAddPrompts:
         [entry] = config.get("manga", [])
         assert entry["title"] == "Blue Lock"
         assert entry["fallback_delay_days"] == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Issue #239 — exit codes and stdout/stderr separation
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestExitCodes:
+    def _seed(self, config, *titles):
+        config.set("manga", [
+            {"title": t, "source": "mangadex.org",
+             "url": f"https://mangadex.org/title/{i}/x", "status": "reading"}
+            for i, t in enumerate(titles)
+        ])
+        config.save()
+
+    def _assert_error_on_stderr(self, capsys, text):
+        captured = capsys.readouterr()
+        assert text in captured.err
+        assert text not in captured.out
+
+    @pytest.mark.parametrize("argv", [
+        ("remove", "missing-title", "--yes"),
+        ("set", "missing-title", "completed"),
+        ("update", "missing-title", "--title", "New"),
+        ("check", "-t", "missing-title"),
+    ])
+    def test_not_found_exits_1_on_stderr(self, run_cli, config, capsys, argv):
+        self._seed(config, "Tracked")
+        capsys.readouterr()
+        assert run_cli(*argv) == 1
+        self._assert_error_on_stderr(capsys, "Not found")
+
+    @pytest.mark.parametrize("argv", [
+        ("remove", "missing-title", "--yes"),
+        ("set", "missing-title", "completed"),
+        ("update", "missing-title", "--title", "New"),
+        ("check", "-t", "missing-title"),
+    ])
+    def test_not_found_on_empty_library_exits_1(self, run_cli, capsys, argv):
+        assert run_cli(*argv) == 1
+        captured = capsys.readouterr()
+        assert captured.err
+        assert captured.out == ""
+
+    def test_update_without_changes_exits_1(self, run_cli, config, capsys):
+        self._seed(config, "Tracked")
+        capsys.readouterr()
+        assert run_cli("update", "Tracked") == 1
+        self._assert_error_on_stderr(capsys, "No changes specified")
+
+    def test_add_missing_url_exits_1(self, run_cli, capsys):
+        assert run_cli("add", "--title", "Only Title") == 1
+        self._assert_error_on_stderr(capsys, "--title and --url required")
+
+    def test_usage_error_keeps_argparse_exit_2(self, run_cli, config):
+        self._seed(config, "Tracked")
+        assert run_cli("set", "Tracked", "not-a-status") == 2
+
+    def test_keyboard_interrupt_exits_130(self, run_cli, monkeypatch, capsys):
+        from memanga import cli
+
+        def _interrupt(args):
+            raise KeyboardInterrupt
+        monkeypatch.setattr(cli, "cmd_list", _interrupt)
+        assert run_cli("list") == 130
+        captured = capsys.readouterr()
+        assert "Interrupted" in captured.err
+        assert captured.out == ""
+
+    def test_search_json_error_keeps_stdout_clean(self, run_cli, capsys):
+        rc = run_cli("search", "Blue Lock", "--json",
+                     "--source", "not-a-real-source.example")
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Unknown source" in captured.err
+
+
+class TestCheckExitCodes:
+    @pytest.fixture
+    def seeded(self, config):
+        config.set("manga", [
+            {"title": t, "source": "mangadex.org",
+             "url": f"https://mangadex.org/title/{i}/x", "status": "reading"}
+            for i, t in enumerate(("Alpha", "Beta"))
+        ])
+        config.save()
+
+    @pytest.fixture
+    def fake_download(self, monkeypatch, tmp_path):
+        """Patch downloads; chapters whose number is in `fail` raise."""
+        from memanga import cli
+        from memanga.downloader import DownloaderError
+
+        fail = set()
+
+        def _download(manga, ch, *a, **k):
+            if ch.number in fail:
+                raise DownloaderError(f"chapter {ch.number} broke")
+            path = tmp_path / f"{manga['title']}-{ch.number}.pdf"
+            path.write_bytes(b"pdf")
+            return path
+        monkeypatch.setattr(cli, "download_chapter", _download)
+        monkeypatch.setattr(cli, "_find_chapter_on_backup", lambda *a, **k: None)
+        return fail
+
+    def _updates(self, monkeypatch, per_title):
+        """`per_title` maps title -> chapter numbers, or an exception."""
+        from memanga import cli
+        from memanga.scrapers.base import Chapter
+
+        def _check(manga, *a, **k):
+            result = per_title[manga["title"]]
+            if isinstance(result, Exception):
+                raise result
+            return [Chapter(number=n) for n in result]
+        monkeypatch.setattr(cli, "check_for_updates", _check)
+
+    def test_all_downloaded_exits_0(self, run_cli, seeded, fake_download,
+                                    monkeypatch, capsys):
+        self._updates(monkeypatch, {"Alpha": ["1"], "Beta": ["2"]})
+        capsys.readouterr()
+        assert run_cli("check", "--auto") == 0
+        captured = capsys.readouterr()
+        assert "2/2 chapters downloaded" in captured.out
+        assert captured.err == ""
+
+    def test_failed_chapter_exits_3(self, run_cli, seeded, fake_download,
+                                    monkeypatch, capsys):
+        from memanga import cli
+
+        self._updates(monkeypatch, {"Alpha": ["1", "2"], "Beta": []})
+        fake_download.add("2")
+        capsys.readouterr()
+        assert run_cli("check", "--auto") == cli.EXIT_PARTIAL == 3
+        captured = capsys.readouterr()
+        assert "1/2 chapters downloaded" in captured.out
+        assert "chapter 2 broke" in captured.err
+        assert "1 chapter(s) failed" in captured.err
+        assert "broke" not in captured.out
+
+    def test_one_source_error_exits_3(self, run_cli, seeded, fake_download,
+                                      monkeypatch, capsys):
+        from memanga.downloader import DownloaderError
+
+        self._updates(monkeypatch, {"Alpha": DownloaderError("HTTP 503"),
+                                    "Beta": ["1"]})
+        capsys.readouterr()
+        assert run_cli("check", "--auto") == 3
+        captured = capsys.readouterr()
+        assert "HTTP 503" in captured.err
+        assert "1/2 manga could not be checked" in captured.err
+        assert "HTTP 503" not in captured.out
+
+    def test_all_sources_error_exits_1(self, run_cli, seeded, fake_download,
+                                       monkeypatch, capsys):
+        from memanga.downloader import DownloaderError
+
+        self._updates(monkeypatch, {"Alpha": DownloaderError("HTTP 503"),
+                                    "Beta": RuntimeError("boom")})
+        capsys.readouterr()
+        assert run_cli("check", "--auto") == 1
+        err = capsys.readouterr().err
+        assert "HTTP 503" in err and "boom" in err
+
+    def test_failed_retry_still_failing_exits_3(self, run_cli, config,
+                                                cli_state, fake_download,
+                                                monkeypatch, capsys):
+        from memanga import cli
+        from memanga.scrapers.base import Chapter
+
+        config.set("manga", [{"title": "Alpha", "source": "mangadex.org",
+                              "url": "https://mangadex.org/title/a/x"}])
+        config.save()
+        cli_state.add_failed_chapter("Alpha", "7", "mangadex.org", "timeout")
+        cli_state.save()
+        scraper = MagicMock()
+        scraper.get_chapters.return_value = [Chapter(number="7")]
+        monkeypatch.setattr(cli, "get_scraper", lambda source: scraper)
+        fake_download.add("7")
+        capsys.readouterr()
+
+        assert run_cli("failed", "--retry") == 3
+        captured = capsys.readouterr()
+        assert "0/1 chapters recovered" in captured.out
+        assert "Still failing" in captured.err
+
+    def test_failed_retry_manga_missing_from_config_exits_3(
+            self, run_cli, config, cli_state, fake_download, capsys):
+        config.set("manga", [])
+        config.save()
+        cli_state.add_failed_chapter("Missing", "7", "mangadex.org", "timeout")
+        cli_state.add_failed_chapter("Missing", "8", "mangadex.org", "timeout")
+        cli_state.save()
+        capsys.readouterr()
+
+        assert run_cli("failed", "--retry") == 3
+        captured = capsys.readouterr()
+        assert "0/2 chapters recovered" in captured.out
+        assert "Manga not found in config: Missing" in captured.err
+
+    def test_failed_retry_manga_without_sources_exits_3(
+            self, run_cli, config, cli_state, fake_download, capsys):
+        config.set("manga", [{"title": "Alpha", "sources": []}])
+        config.save()
+        cli_state.add_failed_chapter("Alpha", "7", "mangadex.org", "timeout")
+        cli_state.save()
+        capsys.readouterr()
+
+        assert run_cli("failed", "--retry") == 3
+        captured = capsys.readouterr()
+        assert "0/1 chapters recovered" in captured.out
+        assert "No source to retry Chapter 7 of Alpha" in captured.err

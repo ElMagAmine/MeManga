@@ -999,6 +999,19 @@ run import memanga_export.json --replace
 | `run import FILE` | Import manga list from JSON |
 | `run import FILE --replace` | Import and replace all data |
 
+### Exit codes
+
+Results go to stdout; errors and warnings go to stderr. Scripts and
+cron jobs can rely on these exit codes:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `1` | Error: manga not found, invalid input, refused or failed command, or `check` could not check any manga |
+| `2` | Invalid command-line usage |
+| `3` | `check` or `failed --retry` ran, but some chapters (or some manga's source checks) failed |
+| `130` | Interrupted with Ctrl-C |
+
 ---
 
 ## Troubleshooting — Windows

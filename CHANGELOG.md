@@ -35,6 +35,12 @@ All notable changes are recorded here. Format loosely follows
   existing `--yes`) to add it anyway. Exact duplicates are still refused.
   An invalid fallback delay in interactive mode asks again instead of
   crashing.
+- #239 CLI exit codes are now predictable: 0 success, 1 error, 2 usage
+  error, 3 when `check` or `failed --retry` ran but some chapters failed,
+  and 130 when interrupted. `remove`, `set`, `update` and `check -t` exit
+  1 when the manga is not found (they used to exit 0), and `check` exits
+  1 when no manga could be checked. Errors and warnings are written to
+  stderr so stdout only carries results.
 
 ## [0.4.4] - 2026-10-03
 
