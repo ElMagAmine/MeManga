@@ -6,6 +6,7 @@ Each subcommand is exercised at least once. Network-touching paths
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import pytest
@@ -1415,3 +1416,176 @@ class TestRichMarkupEscaping:
         out = capsys.readouterr().out
         assert self.CLOSING in out
         assert "Timeout [/retry] [bold]x" in out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Issue #258 — commands must never prompt when stdin is not a terminal
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class _TtyInput(io.StringIO):
+    """Scripted stdin that claims to be a terminal."""
+
+    def isatty(self):
+        return True
+
+
+class TestNonInteractive:
+    @pytest.fixture(autouse=True)
+    def no_tty(self, monkeypatch):
+        # A closed pipe: isatty() is False and any input() raises EOFError.
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+    def _seed(self, config, *titles):
+        config.set("manga", [
+            {"title": t, "source": "mangadex.org",
+             "url": f"https://mangadex.org/title/{i}/x", "status": "reading"}
+            for i, t in enumerate(titles)
+        ])
+        config.save()
+
+    def _titles(self, config):
+        return [m["title"] for m in config.get("manga", []) or []]
+
+    def test_add_unsupported_source_fails_without_yes(self, run_cli, config,
+                                                      capsys):
+        rc = run_cli("add", "--title", "Unsafe",
+                     "--url", "https://unsupported.example/manga")
+        assert rc == 1
+        assert "--yes" in capsys.readouterr().err
+        assert "Unsafe" not in self._titles(config)
+
+    def test_add_unsupported_source_with_yes(self, run_cli, config):
+        rc = run_cli("add", "--title", "Unsafe", "--yes",
+                     "--url", "https://unsupported.example/manga")
+        assert rc == 0
+        assert "Unsafe" in self._titles(config)
+
+    def test_add_similar_title_fails_without_yes(self, run_cli, config, capsys):
+        self._seed(config, "One Piece")
+        rc = run_cli("add", "--title", "One Piece Color",
+                     "--url", "https://mangadex.org/title/z/x")
+        assert rc == 1
+        assert "similar manga" in capsys.readouterr().err
+        assert self._titles(config) == ["One Piece"]
+
+    def test_add_similar_title_with_yes(self, run_cli, config):
+        self._seed(config, "One Piece")
+        rc = run_cli("add", "--title", "One Piece Color", "--yes",
+                     "--url", "https://mangadex.org/title/z/x")
+        assert rc == 0
+        assert "One Piece Color" in self._titles(config)
+
+    def test_add_interactive_flag_fails(self, run_cli, capsys):
+        assert run_cli("add", "--interactive") == 1
+        assert "--title and --url" in capsys.readouterr().err
+
+    def test_rm_fails_without_yes(self, run_cli, config, capsys):
+        self._seed(config, "Goner")
+        rc = run_cli("rm", "Goner")
+        assert rc == 1
+        assert "--yes" in capsys.readouterr().err
+        assert self._titles(config) == ["Goner"]
+
+    def test_rm_with_yes(self, run_cli, config):
+        self._seed(config, "Goner")
+        assert run_cli("rm", "Goner", "--yes") == 0
+        assert self._titles(config) == []
+
+    def test_cron_install_fails_without_time(self, run_cli, monkeypatch,
+                                             capsys):
+        submitted = _capture_crontab(monkeypatch)
+        rc = run_cli("cron", "install")
+        assert rc == 1
+        assert "--time" in capsys.readouterr().err
+        assert "crontab" not in submitted
+
+    def test_cron_install_invalid_time_exits_nonzero(self, run_cli,
+                                                     monkeypatch):
+        _capture_crontab(monkeypatch)
+        assert run_cli("cron", "install", "--time", "six") == 1
+
+    def test_bare_memanga_fails_with_help(self, run_cli, capsys):
+        rc = run_cli()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "usage:" in err
+        assert "needs a terminal" in err
+
+    def test_tui_subcommand_fails(self, run_cli, capsys):
+        assert run_cli("tui") == 1
+        assert "needs a terminal" in capsys.readouterr().err
+
+    def test_interactive_config_fails(self, run_cli, capsys):
+        assert run_cli("config") == 1
+        assert "--show" in capsys.readouterr().err
+
+    def test_check_skips_unconfirmed_chapters(self, run_cli, config,
+                                              monkeypatch, capsys):
+        from memanga import cli
+        from memanga.scrapers.base import Chapter
+
+        self._seed(config, "Mock")
+        monkeypatch.setattr(cli, "check_for_updates",
+                            lambda *a, **k: [Chapter(number="5")])
+        downloads = []
+        monkeypatch.setattr(cli, "download_chapter",
+                            lambda *a, **k: downloads.append(a))
+        rc = run_cli("check")
+        assert rc == 1
+        assert "--auto" in capsys.readouterr().err
+        assert downloads == []
+
+    def test_check_quiet_still_fails_on_unconfirmed(self, run_cli, config,
+                                                    monkeypatch, capsys):
+        from memanga import cli
+        from memanga.scrapers.base import Chapter
+
+        self._seed(config, "Mock")
+        monkeypatch.setattr(cli, "check_for_updates",
+                            lambda *a, **k: [Chapter(number="5")])
+        downloads = []
+        monkeypatch.setattr(cli, "download_chapter",
+                            lambda *a, **k: downloads.append(a))
+        rc = run_cli("check", "--quiet")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "--auto" in err and "--yes" in err
+        assert downloads == []
+
+    def test_real_process_never_reads_stdin(self, isolated_home):
+        """The issue's repro: a subprocess with stdin from /dev/null."""
+        import subprocess
+        root = isolated_home / "cfg"
+        cases = [
+            [],
+            ["add", "--title", "Unsafe", "--url", "https://unsupported.example/manga"],
+            ["cron", "install"],
+        ]
+        for argv in cases:
+            proc = subprocess.run(
+                [sys.executable, "-m", "memanga", "--config-dir", str(root)] + argv,
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                env=dict(os.environ), timeout=120,
+            )
+            assert proc.returncode == 1, (argv, proc.stderr)
+            assert "Traceback" not in proc.stderr, argv
+            assert "error:" in proc.stderr, argv
+
+
+class TestInteractiveStillPrompts:
+    """A real terminal keeps the confirmation flows (#258)."""
+
+    def test_rm_confirms_on_tty(self, run_cli, config, monkeypatch):
+        config.set("manga", [{"title": "Goner", "url": "u",
+                              "source": "mangadex.org", "status": "reading"}])
+        config.save()
+        monkeypatch.setattr(sys, "stdin", _TtyInput("y\nn\n"))
+        assert run_cli("rm", "Goner") == 0
+        assert config.get("manga", []) == []
+
+    def test_cron_install_asks_time_on_tty(self, run_cli, monkeypatch):
+        submitted = _capture_crontab(monkeypatch)
+        monkeypatch.setattr(sys, "stdin", _TtyInput("\n"))
+        assert run_cli("cron", "install") == 0
+        assert "crontab" in submitted
