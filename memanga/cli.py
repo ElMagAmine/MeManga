@@ -44,6 +44,24 @@ def _esc(value) -> str:
     into Rich markup so brackets render literally (issue #375)."""
     return escape(str(value))
 
+
+def _stdin_is_tty() -> bool:
+    """True only when someone can answer a prompt (issue #258).
+
+    Cron, pipes and CI run with stdin closed or redirected; prompting
+    there either blocks or dies with EOFError, so callers must bail.
+    """
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _non_interactive_error(message: str) -> int:
+    """Report input a non-interactive run can't supply; return exit code 1."""
+    sys.stderr.write(f"error: {message}\n")
+    return 1
+
 # Issue #221: `--config-dir DIR` wins over $MEMANGA_CONFIG_DIR, which
 # wins over the default ~/.config/memanga.
 CONFIG_DIR_ENV = "MEMANGA_CONFIG_DIR"
@@ -238,7 +256,14 @@ def cmd_add(args):
     backup_url = None
     fallback_days = 2
     
+    assume_yes = getattr(args, 'yes', False)
+    interactive = _stdin_is_tty()
+
     if args.interactive:
+        if not interactive:
+            return _non_interactive_error(
+                "add --interactive needs a terminal; pass --title and --url instead"
+            )
         # Interactive mode
         console.print("\n[bold green]➕ Add New Manga[/bold green]\n")
         
@@ -282,8 +307,13 @@ def cmd_add(args):
     if not source_ok:
         console.print(f"[yellow]⚠️  Warning:[/yellow] '{_esc(source)}' might not be supported.")
         console.print(f"[dim]Supported: {_esc(', '.join(supported))}[/dim]")
-        if not Confirm.ask("Add anyway?"):
-            return
+        if not assume_yes:
+            if not interactive:
+                return _non_interactive_error(
+                    f"'{source}' might not be supported; pass --yes to add it anyway"
+                )
+            if not Confirm.ask("Add anyway?"):
+                return
     
     # Build manga entry
     if backup_url:
@@ -328,8 +358,13 @@ def cmd_add(args):
         existing_lower = m["title"].lower()
         if (new_lower in existing_lower or existing_lower in new_lower) and new_lower != existing_lower:
             console.print(f"[yellow]⚠️  Similar manga already tracked: [cyan]{_esc(m['title'])}[/cyan][/yellow]")
-            if not Confirm.ask("Add anyway?", default=False):
-                return
+            if not assume_yes:
+                if not interactive:
+                    return _non_interactive_error(
+                        f"similar manga already tracked: '{m['title']}'; pass --yes to add anyway"
+                    )
+                if not Confirm.ask("Add anyway?", default=False):
+                    return
             break
     
     manga_list.append(manga_entry)
@@ -372,6 +407,11 @@ def cmd_remove(args):
         console.print(f"[red]Not found:[/red] {_esc(args.target)}")
         console.print("[dim]Use 'memanga list' to see tracked manga.[/dim]")
         return
+
+    if not args.yes and not _stdin_is_tty():
+        return _non_interactive_error(
+            f"refusing to remove '{found['title']}' without confirmation; pass --yes"
+        )
 
     if args.yes or Confirm.ask(f"Remove [cyan]{_esc(found['title'])}[/cyan]?"):
         manga_list.pop(found_idx)
@@ -539,6 +579,9 @@ def cmd_check(args):
     total_new = 0
     total_downloaded = 0
     total_failed = 0
+    # Chapters left undownloaded because no one could confirm them (#258).
+    total_unconfirmed = 0
+    interactive = _stdin_is_tty()
 
     delivery_mode = config.delivery_mode
     download_dir = config.download_dir
@@ -620,6 +663,10 @@ def cmd_check(args):
 
                 # Download automatically or prompt
                 should_download = args.auto or args.yes
+                if not should_download and not interactive:
+                    # Even --quiet must not hide missing input (#258).
+                    total_unconfirmed += 1
+                    continue
                 if not should_download and not args.quiet:
                     should_download = Confirm.ask(f"     Download {ch_label}?", default=True)
 
@@ -846,6 +893,11 @@ def cmd_check(args):
             console.print(f"[dim]📁 Downloads: {_esc(download_dir)}[/dim]")
     if total_failed > 0:
         console.print(f"[yellow]⚠️  {total_failed} chapter(s) failed — run 'memanga failed' for details.[/yellow]")
+    if total_unconfirmed:
+        return _non_interactive_error(
+            f"skipped {total_unconfirmed} chapter(s) that need confirmation; "
+            "pass --auto or --yes to download without prompting"
+        )
 
 
 def _status_payload() -> Dict[str, Any]:
@@ -972,6 +1024,11 @@ def cmd_config(args):
             f"[dim](threshold: {config.partial_threshold:g}%)[/dim]"
         )
         return
+
+    if not _stdin_is_tty():
+        return _non_interactive_error(
+            "interactive config needs a terminal; use --show or --partial/--partial-threshold"
+        )
 
     console.print(Panel("[bold]⚙️  Configure MeManga[/bold]", border_style="yellow"))
     console.print()
@@ -1117,9 +1174,8 @@ def cmd_config(args):
 def cmd_cron(args):
     """Manage scheduled task for automatic checking."""
     if platform.system() == "Windows":
-        _cmd_cron_windows(args)
-    else:
-        _cmd_cron_unix(args)
+        return _cmd_cron_windows(args)
+    return _cmd_cron_unix(args)
 
 
 def _cmd_cron_unix(args):
@@ -1151,6 +1207,10 @@ def _cmd_cron_unix(args):
         time_str = args.time or config.get("cron.time", "06:00")
 
         if not args.time:
+            if not _stdin_is_tty():
+                return _non_interactive_error(
+                    "cron install needs a terminal to ask for the time; pass --time HH:MM"
+                )
             time_str = Prompt.ask("Check time (HH:MM)", default=time_str)
 
         try:
@@ -1240,6 +1300,10 @@ def _cmd_cron_windows(args):
         time_str = args.time or config.get("cron.time", "06:00")
 
         if not args.time:
+            if not _stdin_is_tty():
+                return _non_interactive_error(
+                    "cron install needs a terminal to ask for the time; pass --time HH:MM"
+                )
             time_str = Prompt.ask("Check time (HH:MM)", default=time_str)
 
         try:
@@ -1475,7 +1539,7 @@ def cmd_search(args):
 
     # Interactive prompt — only when someone is actually at the
     # terminal. Piped/cron invocations just get the table.
-    if not sys.stdin.isatty():
+    if not _stdin_is_tty():
         return 0
 
     console.print()
@@ -1865,6 +1929,10 @@ def cmd_doctor(args):
 
 def cmd_tui(args):
     """Run interactive TUI."""
+    if not _stdin_is_tty():
+        return _non_interactive_error(
+            "the interactive menu needs a terminal; run a subcommand instead (see `memanga --help`)"
+        )
     while True:
         console.clear()
         console.print(Panel.fit(
@@ -2058,6 +2126,7 @@ Examples:
     p_add.add_argument("-b", "--backup", help="Backup source URL")
     p_add.add_argument("--fallback-days", type=int, default=2, help="Days to wait before using backup (default: 2)")
     p_add.add_argument("-i", "--interactive", action="store_true", help="Interactive mode")
+    p_add.add_argument("-y", "--yes", action="store_true", help="Add without confirming unsupported sources or similar titles")
     p_add.set_defaults(func=cmd_add)
     
     # set (change manga status)
@@ -2218,7 +2287,10 @@ Examples:
         return
 
     if args.command is None:
-        # Default to TUI
+        # Default to TUI, but never drop automation into the menu (#258).
+        if not _stdin_is_tty():
+            parser.print_help(sys.stderr)
+            sys.exit(cmd_tui(args))
         cmd_tui(args)
     elif hasattr(args, 'func'):
         result = args.func(args)
