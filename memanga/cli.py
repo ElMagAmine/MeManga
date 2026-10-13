@@ -406,17 +406,62 @@ def cmd_add(args):
         console.print(f"\n[green]✅ Added:[/green] {_esc(title)} ({_esc(source)})")
 
 
+def _is_ascii_number(text: str) -> bool:
+    """True for a non-empty run of 0-9 only (str.isdigit also accepts '²')."""
+    return text.isascii() and text.isdigit()
+
+
 def _find_manga(target: str, manga_list: list):
-    """Find manga by number or partial title match. Returns (manga, index) or (None, None)."""
-    try:
-        idx = int(target) - 1
+    """Resolve a target to one tracked manga (issue #237).
+
+    `#N` picks the Nth entry in `memanga list`. Anything else is a title:
+    an exact case-insensitive match wins, then a unique substring match.
+    A bare number is a title too, so a manga called "86" stays reachable,
+    but only as an exact match: "1" must never substring-hit "Mob Psycho 100".
+
+    Returns (manga, index, candidates); manga is None when nothing or more
+    than one entry matched, and candidates lists the ambiguous matches.
+    """
+    target = target.strip()
+    if target.startswith("#") and _is_ascii_number(target[1:]):
+        idx = int(target[1:]) - 1
         if 0 <= idx < len(manga_list):
-            return manga_list[idx], idx
-    except ValueError:
-        for i, m in enumerate(manga_list):
-            if target.lower() in m["title"].lower():
-                return m, i
-    return None, None
+            return manga_list[idx], idx, []
+        return None, None, []
+
+    needle = target.lower()
+    exact = [i for i, m in enumerate(manga_list) if m["title"].lower() == needle]
+    if len(exact) == 1:
+        return manga_list[exact[0]], exact[0], []
+    if exact or _is_ascii_number(target):
+        matches = exact
+    else:
+        matches = [
+            i for i, m in enumerate(manga_list) if needle and needle in m["title"].lower()
+        ]
+    if len(matches) == 1:
+        return manga_list[matches[0]], matches[0], []
+    return None, None, [manga_list[i] for i in matches]
+
+
+def _target_error(target: str, candidates: list) -> int:
+    """Report a target that matched no manga, or several (issue #237)."""
+    if not candidates:
+        err_console.print(f"[red]Not found:[/red] {_esc(target)}")
+        if _is_ascii_number(target.strip()):
+            err_console.print(
+                f"[dim]A bare number must match a title exactly; "
+                f"use '#{target.strip()}' for the list index.[/dim]"
+            )
+        err_console.print("[dim]Use 'memanga list' to see tracked manga.[/dim]")
+        return EXIT_ERROR
+    err_console.print(
+        f"[red]Ambiguous:[/red] {_esc(target)} matches {len(candidates)} manga:"
+    )
+    for m in candidates:
+        err_console.print(f"  [cyan]{_esc(m['title'])}[/cyan]")
+    err_console.print("[dim]Use the full title, or '#N' from 'memanga list'.[/dim]")
+    return EXIT_ERROR
 
 
 def cmd_remove(args):
@@ -426,12 +471,10 @@ def cmd_remove(args):
     if not manga_list:
         return _error("[yellow]No manga to remove.[/yellow]")
 
-    found, found_idx = _find_manga(args.target, manga_list)
+    found, found_idx, candidates = _find_manga(args.target, manga_list)
 
     if not found:
-        err_console.print(f"[red]Not found:[/red] {_esc(args.target)}")
-        err_console.print("[dim]Use 'memanga list' to see tracked manga.[/dim]")
-        return EXIT_ERROR
+        return _target_error(args.target, candidates)
 
     if not args.yes and not _stdin_is_tty():
         return _non_interactive_error(
@@ -443,8 +486,12 @@ def cmd_remove(args):
         config.set("manga", manga_list)
         config.save()
         
-        # Also remove from state?
-        if args.yes or Confirm.ask("Also remove download history?", default=False):
+        # Download history is only purged on request: --yes confirms the
+        # removal itself, not this extra cleanup (issue #237).
+        purge = getattr(args, "purge", False)
+        if not purge and not args.yes:
+            purge = Confirm.ask("Also remove download history?", default=False)
+        if purge:
             manga_state = state.get("manga", {})
             if found["title"] in manga_state:
                 del manga_state[found["title"]]
@@ -467,10 +514,10 @@ def cmd_set_status(args):
         err_console.print(f"[dim]Valid: {', '.join(VALID_STATUSES)}[/dim]")
         return EXIT_ERROR
 
-    found, found_idx = _find_manga(args.target, manga_list)
+    found, found_idx, candidates = _find_manga(args.target, manga_list)
 
     if not found:
-        return _error(f"[red]Not found:[/red] {_esc(args.target)}")
+        return _target_error(args.target, candidates)
 
     old_status = found.get("status", "reading")
     manga_list[found_idx]["status"] = new_status
@@ -497,12 +544,10 @@ def cmd_update(args):
     if not manga_list:
         return _error("[yellow]No manga tracked.[/yellow]")
 
-    found, found_idx = _find_manga(args.target, manga_list)
+    found, found_idx, candidates = _find_manga(args.target, manga_list)
 
     if not found:
-        err_console.print(f"[red]Not found:[/red] {_esc(args.target)}")
-        err_console.print("[dim]Use 'memanga list' to see tracked manga.[/dim]")
-        return EXIT_ERROR
+        return _target_error(args.target, candidates)
 
     old_title = found["title"]
     changes = []
@@ -575,9 +620,10 @@ def cmd_check(args):
     
     # Filter to specific manga if provided
     if args.title:
-        manga_list = [m for m in manga_list if args.title.lower() in m["title"].lower()]
-        if not manga_list:
-            return _error(f"[red]Not found:[/red] {_esc(args.title)}")
+        found, _, candidates = _find_manga(args.title, manga_list)
+        if not found:
+            return _target_error(args.title, candidates)
+        manga_list = [found]
     
     from_chapter = getattr(args, 'from_chapter', None)
     if getattr(args, 'all', False):
@@ -2007,20 +2053,20 @@ def cmd_tui(args):
             cmd_add(argparse.Namespace(interactive=True, title=None, url=None))
         elif choice == "3":
             cmd_list(argparse.Namespace())
-            target = Prompt.ask("\nEnter # or title to remove (or 'b' to go back)")
+            target = Prompt.ask("\nEnter #N or title to remove (or 'b' to go back)")
             if target != 'b':
-                cmd_remove(argparse.Namespace(target=target, yes=False))
+                cmd_remove(argparse.Namespace(target=target, yes=False, purge=False))
         elif choice == "4":
             cmd_list(argparse.Namespace())
             console.print()
             # Which manga?
-            target = Prompt.ask("Check which manga? ([cyan]a[/cyan]=all, or enter # / title)", default="a")
+            target = Prompt.ask("Check which manga? ([cyan]a[/cyan]=all, or enter #N / title)", default="a")
             title = None
             if target.lower() != "a":
                 manga_list_ref = config.get("manga", [])
-                found, _ = _find_manga(target, manga_list_ref)
+                found, _, candidates = _find_manga(target, manga_list_ref)
                 if not found:
-                    console.print(f"[red]Not found:[/red] {_esc(target)}")
+                    _target_error(target, candidates)
                 else:
                     title = found["title"]
 
@@ -2077,7 +2123,7 @@ def cmd_tui(args):
             cmd_status(argparse.Namespace())
         elif choice == "9":
             cmd_list(argparse.Namespace())
-            target = Prompt.ask("\nEnter # or title to update (or 'b' to go back)")
+            target = Prompt.ask("\nEnter #N or title to update (or 'b' to go back)")
             if target != 'b':
                 url = Prompt.ask("New primary URL (leave blank to skip)", default="") or None
                 backup = Prompt.ask("New backup URL (leave blank to skip)", default="") or None
@@ -2167,19 +2213,20 @@ Examples:
     
     # set (change manga status)
     p_set = subparsers.add_parser("set", help="Set manga status (reading/on-hold/dropped/completed)")
-    p_set.add_argument("target", help="Manga # or title")
+    p_set.add_argument("target", help="Manga title, or #N for its number in 'memanga list'")
     p_set.add_argument("status", choices=VALID_STATUSES, help="New status")
     p_set.set_defaults(func=cmd_set_status)
     
     # remove
     p_remove = subparsers.add_parser("remove", aliases=["rm"], help="Remove a manga")
-    p_remove.add_argument("target", help="Manga # or title")
-    p_remove.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
+    p_remove.add_argument("target", help="Manga title, or #N for its number in 'memanga list'")
+    p_remove.add_argument("-y", "--yes", action="store_true", help="Skip confirmation (keeps download history)")
+    p_remove.add_argument("--purge", action="store_true", help="Also remove its download history")
     p_remove.set_defaults(func=cmd_remove)
 
     # update
     p_update = subparsers.add_parser("update", help="Update manga details (URL, backup, title)")
-    p_update.add_argument("target", help="Manga # or title")
+    p_update.add_argument("target", help="Manga title, or #N for its number in 'memanga list'")
     p_update.add_argument("-u", "--url", help="New primary source URL")
     p_update.add_argument("-b", "--backup", help="New backup source URL")
     p_update.add_argument("-t", "--title", help="Rename manga title")
@@ -2187,7 +2234,7 @@ Examples:
 
     # check
     p_check = subparsers.add_parser("check", help="Check for new chapters")
-    p_check.add_argument("-t", "--title", help="Check specific manga only")
+    p_check.add_argument("-t", "--title", help="Check one manga only (title, or #N from 'memanga list')")
     p_check.add_argument("-f", "--from", dest="from_chapter", type=float, help="Start from chapter N (for fresh downloads)")
     p_check.add_argument("--all", action="store_true", help="Download all chapters from the beginning")
     p_check.add_argument("-a", "--auto", action="store_true", help="Auto-download without prompts")
