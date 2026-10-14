@@ -2169,8 +2169,24 @@ def main():
     try:
         _main()
     except KeyboardInterrupt:
+        _flush_state_on_interrupt()
         err_console.print("\n[dim]Interrupted.[/dim]")
         sys.exit(EXIT_INTERRUPTED)
+
+
+def _flush_state_on_interrupt():
+    """Persist state marked dirty before Ctrl-C (issue #234).
+
+    `check` only saves at the end via update_last_check(), so chapters
+    already recorded as downloaded would otherwise be lost. Best effort:
+    a failed write must not replace the interrupt with a traceback.
+    """
+    if state is None:
+        return
+    try:
+        state.flush()
+    except Exception as e:
+        err_console.print(f"[yellow]⚠️  Could not save state: {_esc(e)}[/yellow]")
 
 
 def _main():

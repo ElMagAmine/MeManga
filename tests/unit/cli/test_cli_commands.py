@@ -2014,6 +2014,36 @@ class TestExitCodes:
         assert "Interrupted" in captured.err
         assert captured.out == ""
 
+    def test_console_script_targets_wrapped_main(self):
+        # Issue #234: the installed `memanga` script must enter through
+        # main(), which owns the Ctrl-C handling, not _main().
+        # Plain-text parse: tomllib is stdlib only on 3.11+ and we support 3.10.
+        import re
+        from pathlib import Path
+
+        pyproject = Path(__file__).resolve().parents[3] / "pyproject.toml"
+        section = re.search(r"^\[project\.scripts\]\n(.*?)(?=^\[|\Z)",
+                            pyproject.read_text(), re.M | re.S)
+        assert section is not None
+        assert re.search(r'^memanga\s*=\s*"memanga\.cli:main"\s*$',
+                         section.group(1), re.M)
+
+    def test_python_m_memanga_interrupt_exits_130(self, monkeypatch, capsys):
+        import runpy
+        from memanga import cli
+
+        def _interrupt():
+            raise KeyboardInterrupt
+        monkeypatch.setattr(cli, "_main", _interrupt)
+        monkeypatch.setattr(cli, "state", None)
+        with pytest.raises(SystemExit) as exc:
+            runpy.run_module("memanga", run_name="__main__")
+        assert exc.value.code == 130
+        captured = capsys.readouterr()
+        assert "Interrupted" in captured.err
+        assert "Traceback" not in captured.err
+        assert captured.out == ""
+
     def test_search_json_error_keeps_stdout_clean(self, run_cli, capsys):
         rc = run_cli("search", "Blue Lock", "--json",
                      "--source", "not-a-real-source.example")
@@ -2158,6 +2188,46 @@ class TestCheckExitCodes:
         captured = capsys.readouterr()
         assert "0/1 chapters recovered" in captured.out
         assert "No source to retry Chapter 7 of Alpha" in captured.err
+
+    def _interrupt_on_beta(self, monkeypatch):
+        from memanga import cli
+        from memanga.scrapers.base import Chapter
+
+        def _check(manga, *a, **k):
+            if manga["title"] == "Beta":
+                raise KeyboardInterrupt
+            return [Chapter(number="1")]
+        monkeypatch.setattr(cli, "check_for_updates", _check)
+
+    def test_interrupted_check_keeps_completed_chapters(
+            self, run_cli, seeded, fake_download, isolated_home,
+            monkeypatch, capsys):
+        # Issue #234: Alpha's chapter is only marked dirty; Ctrl-C before
+        # the end-of-check save must still persist it.
+        from memanga.state import State
+
+        self._interrupt_on_beta(monkeypatch)
+        capsys.readouterr()
+        assert run_cli("check", "--auto") == 130
+        assert "Interrupted" in capsys.readouterr().err
+
+        on_disk = State(isolated_home / ".config" / "memanga")
+        assert on_disk.is_chapter_downloaded("Alpha", "1")
+        assert on_disk.get("last_check") is None
+
+    def test_interrupt_flush_failure_still_exits_130(
+            self, run_cli, seeded, fake_download, monkeypatch, capsys):
+        from memanga.state import State
+
+        def _broken_flush(self):
+            raise OSError("disk full")
+        monkeypatch.setattr(State, "flush", _broken_flush)
+        self._interrupt_on_beta(monkeypatch)
+        capsys.readouterr()
+        assert run_cli("check", "--auto") == 130
+        err = capsys.readouterr().err
+        assert "Could not save state: disk full" in err
+        assert "Interrupted" in err
 
 
 class TestTargetMatching:
