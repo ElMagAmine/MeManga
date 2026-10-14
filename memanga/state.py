@@ -583,6 +583,9 @@ class State:
         """Save the in-chapter resume position for a manga/chapter."""
         if chapter is None or str(chapter).strip() == "":
             return
+        # Issue #224: take the shared reentrant lock (#110) so creating the
+        # entry/positions dicts can't race a worker or the periodic
+        # flush/save; ``_ensure_manga_entry`` also requires it held.
         with self._locked() as data:
             self._ensure_manga_entry(manga_title)
             entry = data["manga"][manga_title]
@@ -605,6 +608,8 @@ class State:
 
     def clear_reader_position(self, manga_title: str, chapter):
         """Drop the saved resume position (e.g. chapter finished)."""
+        # Issue #224: check-then-delete under the shared lock so a
+        # concurrent flush/save never serializes the dict mid-removal.
         with self._locked() as data:
             positions = data.get("manga", {}).get(manga_title, {}).get("reader_positions", {})
             ch = str(chapter)
@@ -747,6 +752,8 @@ class State:
         the guard did not hold back, so it never advances past an unverified
         suspicious jump.
         """
+        # Issue #224: update checks call this from background workers, so
+        # it needs the same shared lock as every other mutator (#110).
         with self._locked() as data:
             self._ensure_manga_entry(manga_title)
             try:
