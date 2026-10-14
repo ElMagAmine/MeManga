@@ -24,6 +24,18 @@ All notable changes are recorded here. Format loosely follows
   `status --json` never includes the app password.
 
 ### Fixed
+- #231 `memanga cron install` and `cron remove` (and the GUI Settings
+  buttons) only change the crontab line they own, now marked with a
+  trailing `# memanga-managed` comment. Other lines, comments and blank
+  lines are kept as they are, including hand-written MeManga jobs. Lines
+  from earlier installs have no marker, so they are left in place and
+  listed; remove them with `crontab -e` to avoid running the check twice.
+  `cron remove` no longer rewrites the crontab when there is no managed
+  line, and `cron status` only reports a job as installed when it is marked.
+  The GUI Settings cron status and install also point out unmarked MeManga
+  lines. Install now refuses to write when `crontab -l` fails for a reason
+  other than "no crontab", and remove keeps scheduled checks enabled in
+  the config when writing the crontab fails.
 - #250 CLI commands no longer print a MangaFire browser-restart notice
   to stdout on exit, which broke `search --json` output.
 - #250 An invalid `config.yaml` no longer crashes the CLI with a

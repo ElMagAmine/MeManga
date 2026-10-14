@@ -28,7 +28,9 @@ from .backup import (
     validate_backup,
 )
 from .config import Config, get_app_password, set_app_password
-from .cron import build_cron_line
+from .cron import (build_cron_line, managed_lines, read_crontab,
+                   remove_managed_lines, replace_managed_line,
+                   unmanaged_memanga_lines)
 from . import doctor
 from .state import State
 from .downloader import check_for_updates, download_chapter, get_supported_sources, DownloaderError, ChapterWithSource, restart_browsers, _find_chapter_on_backup, _get_sources_from_manga
@@ -1258,6 +1260,17 @@ def cmd_cron(args):
     return _cmd_cron_unix(args)
 
 
+def _print_unmanaged_cron_lines(crontab):
+    """Point out MeManga lines that cron install/remove leave alone."""
+    lines = unmanaged_memanga_lines(crontab)
+    if not lines:
+        return
+    console.print("[yellow]These crontab lines mention MeManga but are not "
+                  "managed by 'memanga cron'; edit them with 'crontab -e':[/yellow]")
+    for line in lines:
+        console.print(f"[dim]{_esc(line)}[/dim]")
+
+
 def _cmd_cron_unix(args):
     """Manage cron job (macOS/Linux)."""
     import sys
@@ -1273,14 +1286,17 @@ def _cmd_cron_unix(args):
             text=True,
         )
 
-        if "memanga" in result.stdout.lower():
+        # Issue #231: only the marked line counts as the installed job.
+        existing = result.stdout if result.returncode == 0 else ""
+        owned = managed_lines(existing)
+        if owned:
             console.print("[green]✅ Cron job is installed[/green]")
-            for line in result.stdout.split("\n"):
-                if "memanga" in line.lower():
-                    console.print(f"[dim]{_esc(line)}[/dim]")
+            for line in owned:
+                console.print(f"[dim]{_esc(line)}[/dim]")
         else:
             console.print("[yellow]⚠️  No cron job found[/yellow]")
             console.print("[dim]Use 'memanga cron install' to set up automatic checking.[/dim]")
+        _print_unmanaged_cron_lines(existing)
         return
 
     elif args.action == "install":
@@ -1303,12 +1319,15 @@ def _cmd_cron_unix(args):
                                     config_dir=_context.config_dir)
 
         result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-        existing = result.stdout if result.returncode == 0 else ""
+        existing = read_crontab(result)
+        if existing is None:
+            # Never overwrite a crontab we could not read (issue #231).
+            return _error("[red]Could not read the current crontab; nothing "
+                          f"was changed: {_esc((result.stderr or '').strip())}[/red]")
 
-        lines = [l for l in existing.split("\n") if l and "memanga" not in l.lower()]
-        lines.append(cron_line)
-
-        new_crontab = "\n".join(lines) + "\n"
+        # Issue #231: replace only the line a previous install marked as
+        # managed; every other entry, comment and blank line is kept.
+        new_crontab = replace_managed_line(existing, cron_line)
         process = subprocess.Popen(
             ["crontab", "-"],
             stdin=subprocess.PIPE,
@@ -1323,6 +1342,7 @@ def _cmd_cron_unix(args):
 
             console.print(f"[green]✅ Cron job installed! Will check daily at {time_str}[/green]")
             console.print(f"[dim]{_esc(cron_line)}[/dim]")
+            _print_unmanaged_cron_lines(existing)
         else:
             return _error("[red]Failed to install cron job[/red]")
 
@@ -1332,19 +1352,20 @@ def _cmd_cron_unix(args):
             console.print("[yellow]No crontab found[/yellow]")
             return
 
-        lines = [l for l in result.stdout.split("\n") if l and "memanga" not in l.lower()]
+        new_crontab, removed = remove_managed_lines(result.stdout)
 
-        if len(lines) == len(result.stdout.strip().split("\n")):
+        if not removed:
             console.print("[yellow]No MeManga cron job found[/yellow]")
+            _print_unmanaged_cron_lines(result.stdout)
             return
 
-        new_crontab = "\n".join(lines) + "\n" if lines else ""
-
-        if not lines:
-            subprocess.run(["crontab", "-r"], capture_output=True)
+        if not new_crontab.strip():
+            write = subprocess.run(["crontab", "-r"], capture_output=True)
         else:
-            process = subprocess.Popen(["crontab", "-"], stdin=subprocess.PIPE, text=True)
-            process.communicate(input=new_crontab)
+            write = subprocess.Popen(["crontab", "-"], stdin=subprocess.PIPE, text=True)
+            write.communicate(input=new_crontab)
+        if write.returncode != 0:
+            return _error("[red]Failed to remove cron job[/red]")
 
         config.set("cron.enabled", False)
         config.save()

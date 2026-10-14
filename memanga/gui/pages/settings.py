@@ -20,7 +20,9 @@ from .base import BasePage
 from .. import theme as T
 from ..components.toast import Toast
 from ...backup import EXPORT_VERSION, BackupVersionError, validate_backup
-from ...cron import build_cron_line
+from ...cron import (build_cron_line, managed_lines, read_crontab,
+                     remove_managed_lines, replace_managed_line,
+                     unmanaged_memanga_lines)
 
 
 class _EmailTestSignals(QObject):
@@ -1077,17 +1079,26 @@ class SettingsPage(BasePage):
         cron_cmd = build_cron_line(minute, hour, project_dir, python_path)
         try:
             result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-            existing = result.stdout if result.returncode == 0 else ""
-            lines = [line for line in existing.strip().split("\n") if line and "memanga" not in line]
-            lines.append(cron_cmd)
+            existing = read_crontab(result)
+            if existing is None:
+                # Issue #231: never overwrite a crontab we could not read.
+                Toast(self, "Could not read crontab; nothing changed", kind="error")
+                return
+            # Issue #231: only the managed line is replaced.
             proc = subprocess.run(
-                ["crontab", "-"], input="\n".join(lines) + "\n", capture_output=True, text=True
+                ["crontab", "-"], input=replace_managed_line(existing, cron_cmd),
+                capture_output=True, text=True
             )
             if proc.returncode == 0:
                 self.app.config.set("cron.enabled", True)
                 self.app.config.set("cron.time", f"{hour}:{minute}")
                 self.app.config.save()
-                Toast(self, f"Cron: daily at {hour}:{minute}", kind="success")
+                if unmanaged_memanga_lines(existing):
+                    Toast(self, "Cron set; an older MeManga cron line is still "
+                          "there, remove it with crontab -e", kind="warning",
+                          duration=6000)
+                else:
+                    Toast(self, f"Cron: daily at {hour}:{minute}", kind="success")
             else:
                 Toast(self, f"Failed: {proc.stderr[:40]}", kind="error")
         except Exception as e:
@@ -1140,15 +1151,26 @@ class SettingsPage(BasePage):
             try:
                 result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
                 existing = result.stdout if result.returncode == 0 else ""
-                lines = [line for line in existing.strip().split("\n") if line and "memanga" not in line]
-                subprocess.run(
-                    ["crontab", "-"],
-                    input=("\n".join(lines) + "\n") if lines else "",
-                    capture_output=True, text=True,
-                )
-                Toast(self, "Cron removed", kind="success")
+                # Issue #231: only the managed line is removed; the
+                # crontab is not rewritten when there is none.
+                new_crontab, removed = remove_managed_lines(existing)
+                if removed:
+                    proc = subprocess.run(
+                        ["crontab", "-"], input=new_crontab,
+                        capture_output=True, text=True,
+                    )
+                    if proc.returncode != 0:
+                        Toast(self, f"Failed: {proc.stderr[:40]}", kind="error")
+                        return
+                    Toast(self, "Cron removed", kind="success")
+                else:
+                    # Nothing MeManga owns was removed: keep config as-is,
+                    # like `memanga cron remove`.
+                    Toast(self, "No managed cron found", kind="info")
+                    return
             except Exception:
                 Toast(self, "Failed", kind="error")
+                return
         self.app.config.set("cron.enabled", False)
         self.app.config.save()
 
@@ -1167,9 +1189,14 @@ class SettingsPage(BasePage):
         else:
             try:
                 result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-                found = result.returncode == 0 and "memanga" in result.stdout
+                existing = result.stdout if result.returncode == 0 else ""
+                found = bool(managed_lines(existing))
                 text = "Cron installed" if found else "No cron found"
                 color = T.SUCCESS if found else T.WARNING
+                if unmanaged_memanga_lines(existing):
+                    # Issue #231: lines MeManga does not manage may still run.
+                    text += "; unmanaged MeManga line found, edit with crontab -e"
+                    color = T.WARNING
             except Exception:
                 text, color = "Check failed", T.ERROR
         self._cron_status_label.setText(text)

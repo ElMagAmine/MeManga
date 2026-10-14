@@ -572,7 +572,8 @@ class TestSettingsPage:
             if cmd == ["crontab", "-"]:
                 submitted["crontab"] = input
                 return subprocess.CompletedProcess(cmd, 0, "", "")
-            return subprocess.CompletedProcess(cmd, 1, "", "")
+            return subprocess.CompletedProcess(cmd, 1, "",
+                                               "no crontab for tester\n")
 
         monkeypatch.setattr(settings_mod.subprocess, "run", _fake_run)
 
@@ -581,6 +582,99 @@ class TestSettingsPage:
         expected = build_cron_line("30", "06", project_dir, sys.executable)
         assert expected in submitted["crontab"].splitlines()
         assert f"'{project_dir}'" in submitted["crontab"]
+
+    def _fake_crontab(self, monkeypatch, existing, read_rc=0, read_err="",
+                      write_rc=0):
+        import subprocess
+
+        from memanga.gui.pages import settings as settings_mod
+
+        submitted = {}
+
+        def _fake_run(cmd, input=None, **kwargs):
+            if cmd == ["crontab", "-"]:
+                submitted["crontab"] = input
+                return subprocess.CompletedProcess(cmd, write_rc, "", "")
+            return subprocess.CompletedProcess(cmd, read_rc, existing, read_err)
+
+        monkeypatch.setattr(settings_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(settings_mod.subprocess, "run", _fake_run)
+        return submitted
+
+    _USER_CRONTAB = (
+        "# memanga docker job\n"
+        "\n"
+        "0 5 * * * docker compose -f /srv/memanga/compose.yaml run --rm memanga check\n"
+    )
+
+    def test_cron_install_unix_keeps_unrelated_lines(self, app_window, qapp,
+                                                     monkeypatch, tmp_path):
+        """#231: only the managed line is replaced."""
+        import sys
+
+        from memanga.cron import build_cron_line
+
+        old = build_cron_line("15", "03", tmp_path, sys.executable)
+        submitted = self._fake_crontab(
+            monkeypatch, f"{old}\n{self._USER_CRONTAB}")
+        app_window._pages["settings"]._install_cron_unix(tmp_path, "06", "30")
+
+        expected = build_cron_line("30", "06", tmp_path, sys.executable)
+        assert submitted["crontab"] == f"{self._USER_CRONTAB}{expected}\n"
+
+    def test_cron_remove_unix_only_touches_managed_line(self, app_window, qapp,
+                                                        monkeypatch, tmp_path):
+        import sys
+
+        from memanga.cron import build_cron_line
+
+        page = app_window._pages["settings"]
+        app_window.config.set("cron.enabled", True)
+        submitted = self._fake_crontab(monkeypatch, self._USER_CRONTAB)
+        page._remove_cron()
+        assert submitted == {}
+        assert app_window.config.get("cron.enabled") is True
+
+        managed = build_cron_line("30", "06", tmp_path, sys.executable)
+        submitted = self._fake_crontab(
+            monkeypatch, f"{self._USER_CRONTAB}{managed}\n")
+        page._remove_cron()
+        assert submitted["crontab"] == self._USER_CRONTAB
+        assert app_window.config.get("cron.enabled") is False
+
+    def test_cron_status_unix_requires_managed_line(self, app_window, qapp,
+                                                    monkeypatch):
+        page = app_window._pages["settings"]
+        self._fake_crontab(monkeypatch, self._USER_CRONTAB)
+        page._check_cron_status()
+        assert page._cron_status_label.text().startswith("No cron found")
+        assert "crontab -e" in page._cron_status_label.text()
+
+        self._fake_crontab(monkeypatch, "30 2 * * * /usr/local/bin/backup.sh\n")
+        page._check_cron_status()
+        assert page._cron_status_label.text() == "No cron found"
+
+    def test_cron_install_unix_refuses_unreadable_crontab(self, app_window, qapp,
+                                                          monkeypatch, tmp_path):
+        """#231: a read error other than "no crontab" must not overwrite."""
+        app_window.config.set("cron.enabled", False)
+        submitted = self._fake_crontab(monkeypatch, "", read_rc=1,
+                                       read_err="crontab: Permission denied\n")
+        app_window._pages["settings"]._install_cron_unix(tmp_path, "06", "30")
+        assert submitted == {}
+        assert not app_window.config.get("cron.enabled")
+
+    def test_cron_remove_unix_write_failure_keeps_config(self, app_window, qapp,
+                                                         monkeypatch, tmp_path):
+        import sys
+
+        from memanga.cron import build_cron_line
+
+        app_window.config.set("cron.enabled", True)
+        managed = build_cron_line("30", "06", tmp_path, sys.executable)
+        self._fake_crontab(monkeypatch, f"{managed}\n", write_rc=1)
+        app_window._pages["settings"]._remove_cron()
+        assert app_window.config.get("cron.enabled") is True
 
     def test_import_merge_deduplicates_titles_within_backup(
         self, app_window, qapp, monkeypatch, tmp_path
