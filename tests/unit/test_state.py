@@ -276,6 +276,27 @@ class TestReadingProgress:
         assert state.get_continue_reading() is None
 
 
+class TestStateLockCoverage:
+    def test_remaining_public_mutators_use_shared_lock(self, state):
+        from contextlib import contextmanager
+
+        lock_entries = []
+        original_locked = state._locked
+
+        @contextmanager
+        def recording_locked():
+            lock_entries.append(True)
+            with original_locked() as data:
+                yield data
+
+        state._locked = recording_locked
+
+        state.set_reader_position("X", "1", mode="paged", page_index=2)
+        state.clear_reader_position("X", "1")
+        state.set_catalogue_baseline("X", 3)
+
+        assert len(lock_entries) == 3, f"expected 3 shared lock entries, got {len(lock_entries)}"
+
 class TestReaderPosition:
     """Issue #106 — per-chapter in-reader resume position."""
 
