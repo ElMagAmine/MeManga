@@ -810,6 +810,10 @@ Add a backup source? [y/n]: y
 run add -t "Jujutsu Kaisen" -u "https://tcbonepiecechapters.com/mangas/13/jjk" -b "https://mangadex.org/title/some-uuid" --fallback-days 3
 ```
 
+`--fallback-days` accepts whole numbers of days, 0 or greater (default: 2).
+Use `--fallback-days 0` to use the backup immediately. Negative values and
+non-integers are rejected before any config is saved.
+
 ### How fallback works
 
 1. MeManga checks the primary source first
