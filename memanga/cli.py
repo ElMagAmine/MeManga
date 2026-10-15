@@ -551,8 +551,36 @@ def _target_error(target: str, candidates: list) -> int:
     return EXIT_ERROR
 
 
+def _shares_download_dir(title: str, others) -> bool:
+    """True if another tracked manga writes to the same download folder.
+
+    Sanitizing can map different titles to one folder ("A:B" and "AB"),
+    and case-insensitive filesystems merge "x" and "X" too.
+    """
+    from .downloader import _sanitize_filename
+    name = _sanitize_filename(title).casefold()
+    return any(_sanitize_filename(m.get("title", "")).casefold() == name
+               for m in others)
+
+
 def cmd_remove(args):
-    """Remove a manga from tracking."""
+    """Remove a manga from tracking.
+
+    Issue #349: download history and downloaded files are kept unless
+    explicitly requested. ``--yes`` only answers the removal confirmation;
+    it never implies --purge-history or --delete-files.
+    """
+    from .downloader import (UnsafeDownloadPathError, delete_manga_downloads,
+                             find_manga_downloads)
+
+    # getattr: the TUI builds its own Namespace without these flags.
+    purge_history = (getattr(args, "purge_history", False)
+                     or getattr(args, "purge", False))
+    keep_files = getattr(args, "keep_files", False)
+    delete_files = getattr(args, "delete_files", False)
+    if keep_files and delete_files:
+        return _error("[red]--keep-files and --delete-files are mutually exclusive.[/red]")
+
     manga_list = config.get("manga", [])
 
     if not manga_list:
@@ -568,23 +596,68 @@ def cmd_remove(args):
             f"refusing to remove '{found['title']}' without confirmation; pass --yes"
         )
 
-    if args.yes or Confirm.ask(f"Remove [cyan]{_esc(found['title'])}[/cyan]?"):
-        manga_list.pop(found_idx)
-        config.set("manga", manga_list)
-        config.save()
-        
-        # Download history is only purged on request: --yes confirms the
-        # removal itself, not this extra cleanup (issue #237).
-        purge = getattr(args, "purge", False)
-        if not purge and not args.yes:
-            purge = Confirm.ask("Also remove download history?", default=False)
-        if purge:
-            manga_state = state.get("manga", {})
-            if found["title"] in manga_state:
-                del manga_state[found["title"]]
-                state.set("manga", manga_state)
-        
-        console.print(f"[red]🗑️  Removed:[/red] {_esc(found['title'])}")
+    title = found["title"]
+    others = manga_list[:found_idx] + manga_list[found_idx + 1:]
+
+    # Resolve the file target before anything is written, so an unsafe
+    # --delete-files request leaves config, state and files untouched.
+    files_dir = None
+    if delete_files:
+        if _shares_download_dir(title, others):
+            return _error(
+                f"[red]Refusing to delete files:[/red] another tracked manga "
+                f"uses the same download folder as {_esc(title)}."
+            )
+        try:
+            files_dir = find_manga_downloads(config.download_dir, title)
+        except (UnsafeDownloadPathError, OSError) as e:
+            return _error(f"[red]Refusing to delete files:[/red] {_esc(e)}")
+
+    if not args.yes:
+        prompt = f"Remove [cyan]{_esc(title)}[/cyan]"
+        if files_dir is not None:
+            prompt += f" and delete [yellow]{_esc(files_dir)}[/yellow]"
+        if not Confirm.ask(prompt + "?"):
+            return None
+        # Interactive runs may opt in to extra cleanup; both default to
+        # no and are asked before anything is written (issues #237/#349).
+        if not purge_history:
+            purge_history = Confirm.ask("Also remove download history?", default=False)
+        if not keep_files and not delete_files and not _shares_download_dir(title, others):
+            try:
+                candidate = find_manga_downloads(config.download_dir, title)
+            except (UnsafeDownloadPathError, OSError):
+                candidate = None
+            if candidate is not None and Confirm.ask(
+                    f"Also delete downloaded files in [yellow]{_esc(candidate)}[/yellow]?",
+                    default=False):
+                delete_files, files_dir = True, candidate
+
+    manga_list.pop(found_idx)
+    config.set("manga", manga_list)
+    config.save()
+
+    if purge_history:
+        manga_state = state.get("manga", {})
+        if title in manga_state:
+            del manga_state[title]
+            state.set("manga", manga_state)
+
+    console.print(f"[red]🗑️  Removed:[/red] {_esc(title)}")
+    if purge_history:
+        console.print("[dim]Download history removed.[/dim]")
+
+    if delete_files:
+        try:
+            deleted = delete_manga_downloads(config.download_dir, title)
+        except (UnsafeDownloadPathError, OSError) as e:
+            return _error(
+                f"[red]Removed from tracking, but could not delete its files:[/red] {_esc(e)}"
+            )
+        if deleted is None:
+            console.print("[dim]No downloaded files to delete.[/dim]")
+        else:
+            console.print(f"[dim]Deleted downloaded files: {_esc(deleted)}[/dim]")
 
 
 def cmd_set_status(args):
@@ -2356,8 +2429,16 @@ Examples:
     # remove
     p_remove = subparsers.add_parser("remove", aliases=["rm"], help="Remove a manga")
     p_remove.add_argument("target", help="Manga title, or #N for its number in 'memanga list'")
-    p_remove.add_argument("-y", "--yes", action="store_true", help="Skip confirmation (keeps download history)")
-    p_remove.add_argument("--purge", action="store_true", help="Also remove its download history")
+    p_remove.add_argument("-y", "--yes", action="store_true",
+                          help="Skip the removal confirmation only (never purges history or deletes files)")
+    # --purge is the pre-#349 spelling, kept as an alias.
+    p_remove.add_argument("--purge-history", "--purge", dest="purge_history", action="store_true",
+                          help="Also remove its download history")
+    files_group = p_remove.add_mutually_exclusive_group()
+    files_group.add_argument("--keep-files", action="store_true",
+                             help="Keep its downloaded files (default; skips the interactive prompt)")
+    files_group.add_argument("--delete-files", action="store_true",
+                             help="Also delete its download folder (<download dir>/<title>)")
     p_remove.set_defaults(func=cmd_remove)
 
     # update

@@ -443,8 +443,32 @@ run remove "#1"
 ```
 
 A title that matches more than one manga is refused and the matches are
-listed, so use the full title. `--yes` skips the confirmation but keeps the
-download history; add `--purge` to remove that too.
+listed, so use the full title.
+
+Removing only stops tracking: download history and downloaded files are
+kept unless you ask for more.
+
+| Option | Effect |
+|---|---|
+| `-y`, `--yes` | Skip the removal confirmation. It never purges history or deletes files. |
+| `--purge-history` | Also remove its download history. `--purge` is an older alias. |
+| `--keep-files` | Keep its downloaded files (the default). |
+| `--delete-files` | Also delete its download folder, `<download dir>/<title>`. |
+
+`--keep-files` and `--delete-files` can't be combined. Without `--yes`, a
+terminal session asks whether to remove the manga, then whether to remove
+its history and its files (both default to no); the flags answer those
+questions up front. Without a terminal (cron, scripts) nothing is asked,
+so `--yes` is required:
+
+```bash
+run remove "One Piece" --yes --purge-history --delete-files
+```
+
+`--delete-files` only deletes that manga's own folder inside the download
+directory. It refuses, before changing anything, if that folder is a
+symlink or another tracked manga uses the same folder. Files saved at the
+top of the download directory by old versions are left alone.
 
 ---
 
