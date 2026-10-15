@@ -832,8 +832,6 @@ manga:
       - url: "https://mangadex.org/title/some-uuid"
 ```
 
-Set `fallback_delay_days: 0` to use the backup immediately without waiting.
-
 ---
 
 ## Updating Manga Details
