@@ -2776,3 +2776,215 @@ class TestTargetMatching:
         assert self._titles(config) == []
         fresh = State(config_dir=cli_state.state_path.parent)
         assert fresh.get_downloaded_chapters("Goner") == []
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Issue #349 — explicit history and file choices for `remove`
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestRemoveHistoryAndFiles:
+    @pytest.fixture(autouse=True)
+    def no_tty(self, monkeypatch):
+        # Any unexpected prompt dies with EOFError on a closed pipe.
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+    @pytest.fixture
+    def downloads(self, config, tmp_path):
+        root = tmp_path / "downloads"
+        root.mkdir()
+        config.set("delivery.download_dir", str(root))
+        config.set("manga", [
+            {"title": "Goner", "source": "mangadex.org", "url": "u1", "status": "reading"},
+            {"title": "Keeper", "source": "mangadex.org", "url": "u2", "status": "reading"},
+        ])
+        config.save()
+        goner = root / "Goner"
+        (goner / "Chapter 2").mkdir(parents=True)
+        (goner / "Goner - Chapter 1.cbz").write_text("a")
+        (goner / "Chapter 2" / "001.jpg").write_text("img")
+        (root / "Keeper").mkdir()
+        (root / "Keeper" / "Keeper - Chapter 1.cbz").write_text("k")
+        # Pre-#21 layout: a root-level file is never touched.
+        (root / "Goner - Chapter 0.cbz").write_text("legacy")
+        return root
+
+    @pytest.fixture
+    def history(self, cli_state):
+        cli_state.add_downloaded_chapter("Goner", "1")
+        cli_state.save()
+        return cli_state
+
+    def _titles(self, config):
+        return [m["title"] for m in config.get("manga", [])]
+
+    def _history(self, cli_state):
+        from memanga.state import State
+        return State(config_dir=cli_state.state_path.parent).get_downloaded_chapters("Goner")
+
+    def _untouched(self, root):
+        assert (root / "Keeper" / "Keeper - Chapter 1.cbz").read_text() == "k"
+        assert (root / "Goner - Chapter 0.cbz").read_text() == "legacy"
+
+    @pytest.mark.parametrize("flags, history_kept, files_kept", [
+        ((), True, True),
+        (("--keep-files",), True, True),
+        (("--purge-history",), False, True),
+        (("--purge",), False, True),
+        (("--purge-history", "--keep-files"), False, True),
+        (("--delete-files",), True, False),
+        (("--purge-history", "--delete-files"), False, False),
+        (("--purge", "--delete-files"), False, False),
+    ])
+    def test_yes_combinations(self, run_cli, config, downloads, history,
+                              flags, history_kept, files_kept):
+        assert run_cli("rm", "Goner", "--yes", *flags) == 0
+        assert self._titles(config) == ["Keeper"]
+        assert (self._history(history) == ["1"]) is history_kept
+        assert (downloads / "Goner").exists() is files_kept
+        self._untouched(downloads)
+
+    def test_keep_and_delete_files_conflict_changes_nothing(
+            self, run_cli, config, downloads, history):
+        assert run_cli("rm", "Goner", "--yes", "--purge-history",
+                       "--keep-files", "--delete-files") == 2
+        assert self._titles(config) == ["Goner", "Keeper"]
+        assert self._history(history) == ["1"]
+        assert (downloads / "Goner" / "Goner - Chapter 1.cbz").exists()
+
+    def test_conflict_rejected_for_direct_namespace(self, config, downloads,
+                                                    monkeypatch):
+        import argparse
+        from memanga import cli
+        from memanga.config import Config
+        monkeypatch.setattr(cli, "config", Config())
+        args = argparse.Namespace(target="Goner", yes=True, purge_history=False,
+                                  keep_files=True, delete_files=True)
+        assert cli.cmd_remove(args) == 1
+        assert self._titles(config) == ["Goner", "Keeper"]
+        assert (downloads / "Goner").exists()
+
+    def test_delete_files_without_yes_refuses_off_tty(
+            self, run_cli, config, downloads, capsys):
+        assert run_cli("rm", "Goner", "--delete-files") == 1
+        assert "--yes" in capsys.readouterr().err
+        assert self._titles(config) == ["Goner", "Keeper"]
+        assert (downloads / "Goner").exists()
+
+    def test_delete_files_with_no_folder(self, run_cli, config, downloads, capsys):
+        import shutil
+        shutil.rmtree(downloads / "Goner")
+        capsys.readouterr()
+        assert run_cli("rm", "Goner", "--yes", "--delete-files") == 0
+        assert "No downloaded files" in capsys.readouterr().out
+        assert self._titles(config) == ["Keeper"]
+        self._untouched(downloads)
+
+    def test_delete_files_with_no_download_root(self, run_cli, config, tmp_path):
+        config.set("delivery.download_dir", str(tmp_path / "missing"))
+        config.set("manga", [{"title": "Goner", "source": "mangadex.org", "url": "u"}])
+        config.save()
+        assert run_cli("rm", "Goner", "--yes", "--delete-files") == 0
+        assert self._titles(config) == []
+        assert not (tmp_path / "missing").exists()
+
+    def test_symlinked_folder_is_refused_before_any_change(
+            self, run_cli, config, downloads, history, tmp_path, capsys):
+        import shutil
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "precious.txt").write_text("p")
+        shutil.rmtree(downloads / "Goner")
+        (downloads / "Goner").symlink_to(outside, target_is_directory=True)
+        assert run_cli("rm", "Goner", "--yes", "--purge-history",
+                       "--delete-files") == 1
+        assert "symlink" in capsys.readouterr().err
+        assert self._titles(config) == ["Goner", "Keeper"]
+        assert self._history(history) == ["1"]
+        assert (outside / "precious.txt").read_text() == "p"
+        assert (downloads / "Goner").is_symlink()
+
+    def test_symlink_inside_folder_is_not_followed(
+            self, run_cli, config, downloads, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "precious.txt").write_text("p")
+        (downloads / "Goner" / "link").symlink_to(outside, target_is_directory=True)
+        assert run_cli("rm", "Goner", "--yes", "--delete-files") == 0
+        assert not (downloads / "Goner").exists()
+        assert (outside / "precious.txt").read_text() == "p"
+
+    def test_file_in_place_of_folder_is_refused(self, run_cli, config, downloads):
+        import shutil
+        shutil.rmtree(downloads / "Goner")
+        (downloads / "Goner").write_text("not a dir")
+        assert run_cli("rm", "Goner", "--yes", "--delete-files") == 1
+        assert self._titles(config) == ["Goner", "Keeper"]
+        assert (downloads / "Goner").read_text() == "not a dir"
+
+    def test_shared_folder_is_refused(self, run_cli, config, downloads, capsys):
+        # "Goner:" sanitizes to the same folder as "Goner".
+        config.set("manga", config.get("manga") + [
+            {"title": "Goner:", "source": "mangadex.org", "url": "u3"}])
+        config.save()
+        assert run_cli("rm", "Goner", "--yes", "--delete-files") == 1
+        assert "same download folder" in capsys.readouterr().err
+        assert self._titles(config) == ["Goner", "Keeper", "Goner:"]
+        assert (downloads / "Goner").exists()
+
+    # Interactive: prompts are remove → history → files, all default no.
+
+    def test_tty_defaults_keep_history_and_files(
+            self, run_cli, config, downloads, history, monkeypatch):
+        monkeypatch.setattr(sys, "stdin", _TtyInput("y\n\n\n"))
+        assert run_cli("rm", "Goner") == 0
+        assert self._titles(config) == ["Keeper"]
+        assert self._history(history) == ["1"]
+        assert (downloads / "Goner").exists()
+
+    def test_tty_can_opt_in_to_both(self, run_cli, config, downloads, history,
+                                    monkeypatch):
+        monkeypatch.setattr(sys, "stdin", _TtyInput("y\ny\ny\n"))
+        assert run_cli("rm", "Goner") == 0
+        assert self._history(history) == []
+        assert not (downloads / "Goner").exists()
+        self._untouched(downloads)
+
+    def test_tty_keep_files_skips_file_prompt(self, run_cli, config, downloads,
+                                              monkeypatch):
+        # A third prompt would hit EOF and fail the command.
+        monkeypatch.setattr(sys, "stdin", _TtyInput("y\nn\n"))
+        assert run_cli("rm", "Goner", "--keep-files") == 0
+        assert (downloads / "Goner").exists()
+
+    def test_tty_delete_files_and_purge_skip_their_prompts(
+            self, run_cli, config, downloads, history, monkeypatch):
+        monkeypatch.setattr(sys, "stdin", _TtyInput("y\n"))
+        assert run_cli("rm", "Goner", "--purge-history", "--delete-files") == 0
+        assert self._history(history) == []
+        assert not (downloads / "Goner").exists()
+
+    def test_tty_declined_removal_changes_nothing(
+            self, run_cli, config, downloads, history, monkeypatch):
+        monkeypatch.setattr(sys, "stdin", _TtyInput("n\n"))
+        assert run_cli("rm", "Goner", "--purge-history", "--delete-files") == 0
+        assert self._titles(config) == ["Goner", "Keeper"]
+        assert self._history(history) == ["1"]
+        assert (downloads / "Goner").exists()
+
+    def test_tui_namespace_keeps_files_by_default(self, config, downloads,
+                                                  monkeypatch):
+        import argparse
+        from memanga import cli
+        from memanga.config import Config
+        monkeypatch.setattr(cli, "config", Config())
+        monkeypatch.setattr(sys, "stdin", _TtyInput("y\nn\nn\n"))
+        cli.cmd_remove(argparse.Namespace(target="Goner", yes=False, purge=False))
+        assert self._titles(config) == ["Keeper"]
+        assert (downloads / "Goner").exists()
+
+    def test_help_lists_explicit_flags(self, run_cli, capsys):
+        run_cli("rm", "--help")
+        out = capsys.readouterr().out
+        for flag in ("--purge-history", "--keep-files", "--delete-files"):
+            assert flag in out

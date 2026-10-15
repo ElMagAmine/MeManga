@@ -1477,6 +1477,49 @@ def rename_manga_downloads(download_dir, old_title: str, new_title: str) -> bool
     return moved
 
 
+class UnsafeDownloadPathError(Exception):
+    """A manga's download folder can't be deleted safely."""
+
+
+def find_manga_downloads(download_dir, title: str) -> Optional[Path]:
+    """Return the manga's managed download folder, or ``None`` if absent.
+
+    Only ``<download_dir>/<sanitized title>`` is considered — the folder
+    ``download_chapter`` writes to. Raises ``UnsafeDownloadPathError``
+    when that entry is a symlink, not a directory, or resolves anywhere
+    but directly inside the download root (issue #349).
+    """
+    root = Path(download_dir).expanduser()
+    if not root.is_dir():
+        return None
+    name = _sanitize_filename(title)
+    if name in ("", ".", "..") or "/" in name or "\\" in name:
+        raise UnsafeDownloadPathError(f"unusable folder name for {title!r}")
+    target = root / name
+    if not os.path.lexists(target):
+        return None
+    if target.is_symlink():
+        raise UnsafeDownloadPathError(f"{target} is a symlink")
+    if not target.is_dir():
+        raise UnsafeDownloadPathError(f"{target} is not a directory")
+    if target.resolve(strict=True).parent != root.resolve(strict=True):
+        raise UnsafeDownloadPathError(f"{target} is outside {root}")
+    return target
+
+
+def delete_manga_downloads(download_dir, title: str) -> Optional[Path]:
+    """Delete the manga's managed download folder; return what was removed.
+
+    Returns ``None`` when there is nothing to delete. Symlinks inside the
+    folder are unlinked, never followed.
+    """
+    target = find_manga_downloads(download_dir, title)
+    if target is None:
+        return None
+    shutil.rmtree(target)
+    return target
+
+
 def _format_chapter_number(chapter_num: str) -> str:
     """
     Format chapter number for proper alphabetical sorting.
