@@ -136,6 +136,66 @@ class TestAddCommand:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# `add --fallback-days` — validate before writing config (#420)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestAddFallbackDays:
+    @pytest.fixture(autouse=True)
+    def no_network(self, monkeypatch):
+        from memanga import cli
+        monkeypatch.setattr(cli, "get_scraper", lambda source: types.SimpleNamespace(
+            get_cover_url=lambda url: None))
+
+    @pytest.mark.parametrize("existing", [False, True], ids=["new", "existing"])
+    @pytest.mark.parametrize("flags", [
+        ("--fallback-days", "-1"),
+        ("--fallback-days=-7",),
+        ("--fallback-days", "-1", "--force"),
+        ("--fallback-days", "abc"),
+        ("--fallback-days", "1.5"),
+    ])
+    def test_invalid_delay_does_not_write_config(self, run_cli, isolated_home,
+                                                capsys, flags, existing):
+        path = isolated_home / ".config" / "memanga" / "config.yaml"
+        before = b"# Keep this formatting\nmanga:\n  - title: Existing Manga\n"
+        if existing:
+            path.write_bytes(before)
+
+        rc = run_cli("add", "--title", "Delay Test",
+                     "--url", "https://mangadex.org/title/a/x",
+                     "--backup", "https://mangapill.com/manga/1/x", *flags)
+
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "--fallback-days" in err
+        assert "non-negative integer" in err
+        if existing:
+            assert path.read_bytes() == before
+        else:
+            assert not path.exists()
+
+    @pytest.mark.parametrize(("flags", "expected"), [
+        (("--fallback-days", "0"), 0),
+        (("--fallback-days", "3"), 3),
+        (("--fallback-days=7",), 7),
+        ((), 2),
+    ])
+    def test_valid_delay_is_saved(self, run_cli, config, flags, expected):
+        rc = run_cli("add", "--title", "Delay Test",
+                     "--url", "https://mangadex.org/title/a/x",
+                     "--backup", "https://mangapill.com/manga/1/x", *flags)
+
+        assert rc == 0
+        [entry] = config.get("manga", [])
+        assert entry["fallback_delay_days"] == expected
+        assert entry["sources"] == [
+            {"url": "https://mangadex.org/title/a/x"},
+            {"url": "https://mangapill.com/manga/1/x"},
+        ]
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # `remove` / `rm`
 # ─────────────────────────────────────────────────────────────────────────
 

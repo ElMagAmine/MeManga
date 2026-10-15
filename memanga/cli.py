@@ -149,6 +149,21 @@ def _print_json(payload):
     print(json.dumps(payload, indent=2))
 
 
+def _non_negative_int_arg(value):
+    """argparse type for whole numbers >= 0."""
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"expected a non-negative integer, got {value!r}"
+        )
+    if num < 0:
+        raise argparse.ArgumentTypeError(
+            f"expected a non-negative integer, got {value!r}"
+        )
+    return num
+
+
 def _partial_threshold_arg(value):
     """argparse type for --partial-threshold: a percentage in [0, 100].
 
@@ -2238,7 +2253,8 @@ Examples:
     p_add.add_argument("-t", "--title", help="Manga title")
     p_add.add_argument("-u", "--url", help="Primary source URL")
     p_add.add_argument("-b", "--backup", help="Backup source URL")
-    p_add.add_argument("--fallback-days", type=int, default=2, help="Days to wait before using backup (default: 2)")
+    p_add.add_argument("--fallback-days", type=_non_negative_int_arg, default=2,
+                       help="Days to wait before using backup (0 or more; default: 2)")
     p_add.add_argument("-i", "--interactive", action="store_true", help="Interactive mode")
     p_add.add_argument("-f", "--force", "-y", "--yes", dest="force", action="store_true",
                        help="Add even if the source might be unsupported or a similar title is tracked")
