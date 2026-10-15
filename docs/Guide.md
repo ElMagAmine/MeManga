@@ -359,7 +359,7 @@ MeManga will prompt you step by step:
 ```
 ➕ Add New Manga
 
-Supported sources: mangadex.org, weebcentral.com, mangafire.to, ...
+N supported sources; run `memanga sources` to see them.
 
 📖 Manga title: One Piece
 🔗 Primary source URL: https://tcbonepiecechapters.com/mangas/5/one-piece
@@ -381,6 +381,31 @@ Add with a backup source:
 ```bash
 run add -t "Solo Leveling" -u "https://mangafire.to/manga/solo-leveling.xxx" -b "https://mangadex.org/title/uuid-here"
 ```
+
+Set the per-manga fields the desktop app manages while adding:
+
+```bash
+run add -t "Blue Lock" -u "https://mangadex.org/title/uuid-here" --status on-hold --mode manual --no-kindle
+```
+
+| Flag | Values | Default when omitted |
+|------|--------|----------------------|
+| `--status` | `reading`, `on-hold`, `dropped`, `completed` | `reading` |
+| `--mode` | `auto`, `manual` | `auto` |
+| `--kindle` / `--no-kindle` | per-manga Kindle toggle on or off | on |
+
+`--kindle` and `--no-kindle` cannot be combined. `--mode` and the Kindle
+toggle are the same per-manga settings shown on the desktop app's manga page,
+and both are honored by the desktop app (the Kindle toggle only matters when
+email delivery is enabled). CLI `check --auto` and cron currently still
+process every `reading` manga regardless of these per-manga mode and Kindle
+settings. Omitted flags are not written to `config.yaml`, so the defaults
+above apply. Invalid values are rejected before any config is saved. These
+flags also work with `add -i`, which does not ask for them. Output format
+stays global (`config`, or `check --format`); there is no per-manga format.
+
+If a URL's site is not recognized, `add` warns and points you to
+`run sources` for the list of supported sites.
 
 ### View your tracked manga
 
@@ -543,7 +568,8 @@ Each manga has a status that controls whether it gets checked during `run check`
 | `dropped` | No | Stopped reading |
 | `completed` | No | Manga is finished, no more chapters expected |
 
-New manga default to `reading`.
+New manga default to `reading`; pass `add --status` to start with another
+status.
 
 ### Set a manga to on-hold
 
@@ -987,6 +1013,7 @@ run import memanga_export.json --replace
 | `run add -i` | Add manga interactively |
 | `run add -t "Title" -u URL` | Add manga directly |
 | `run add -t "Title" -u URL -b BACKUP` | Add with backup source |
+| `run add -t "Title" -u URL --status on-hold --mode manual --no-kindle` | Add with status, mode and Kindle setting |
 | `run check` | Check for new chapters (interactive) |
 | `run check --auto` | Auto-download all new chapters |
 | `run check -t "Title"` | Check one manga |
