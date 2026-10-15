@@ -117,6 +117,33 @@ class TestListCommand:
 
 
 class TestAddCommand:
+    @pytest.fixture(autouse=True)
+    def no_network(self, monkeypatch):
+        from memanga import cli
+        monkeypatch.setattr(cli, "get_scraper", lambda source: types.SimpleNamespace(
+            get_cover_url=lambda url: None))
+
+    @pytest.mark.parametrize("title", ["One Piece", "oNe PiEcE"])
+    @pytest.mark.parametrize("flags", [(), ("--force",), ("--yes",), ("-f",), ("-y",)])
+    @pytest.mark.parametrize("url", [
+        "https://mangadex.org/title/original/x",
+        "https://mangadex.org/title/different/x",
+    ])
+    def test_duplicate_exits_1_without_writing(self, run_cli, isolated_home,
+                                              config, capsys, title, flags, url):
+        assert run_cli("add", "--title", "One Piece", "--url",
+                       "https://mangadex.org/title/original/x") == 0
+        path = isolated_home / ".config" / "memanga" / "config.yaml"
+        before = path.read_bytes()
+        capsys.readouterr()
+
+        rc = run_cli("add", "--title", title, "--url", url, *flags)
+
+        assert rc == 1
+        assert "already exists" in capsys.readouterr().err
+        assert path.read_bytes() == before
+        assert [m["title"] for m in config.get("manga")] == ["One Piece"]
+
     def test_add_basic(self, run_cli, config):
         rc = run_cli("add",
                       "--url", "https://mangadex.org/title/abc/x",
