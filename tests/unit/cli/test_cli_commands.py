@@ -1564,6 +1564,20 @@ class TestFailedJson:
         assert failed["source"] == "mangadex.org"
         assert failed["recorded_at"]
 
+    def test_failed_record_wins_over_partial(self, run_cli, cli_state, capsys):
+        # A partial that later failed on retry is listed once, as failed.
+        cli_state.add_partial_chapter("Berserk", "1", source="mangapill.com",
+                                      failed_pages=[2], total_pages=20)
+        cli_state.add_failed_chapter("Berserk", "1", "mangadex.org", "timeout")
+
+        assert run_cli("failed", "--json") == 0
+        payload = _stdout_json(capsys)
+        assert payload["count"] == 1
+        entry, = payload["chapters"]
+        assert (entry["status"], entry["source"], entry["error"]) == (
+            "failed", "mangadex.org", "timeout")
+        assert entry["total_pages"] is None
+
     def test_title_filter(self, run_cli, cli_state, capsys):
         cli_state.add_failed_chapter("Vinland Saga", "10", "mangadex.org", "x")
         cli_state.add_failed_chapter("Berserk", "1", "mangadex.org", "y")
