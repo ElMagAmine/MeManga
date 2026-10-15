@@ -13,7 +13,7 @@ import subprocess
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 from rich.console import Console
 from rich.markup import escape
@@ -33,7 +33,7 @@ from .cron import (build_cron_line, build_task_command, managed_lines,
                    remove_managed_lines, replace_managed_line,
                    source_checkout_root, unmanaged_memanga_lines)
 from . import doctor
-from .state import State
+from .state import State, _chapter_number
 from .downloader import check_for_updates, download_chapter, get_supported_sources, DownloaderError, ChapterWithSource, restart_browsers, _find_chapter_on_backup, _get_sources_from_manga
 from .scrapers import get_scraper
 from .search import compute_search_sources, probe_chapter_counts, sweep
@@ -217,8 +217,35 @@ def _get_sources_display(manga: Dict[str, Any]) -> str:
     return manga.get("source", "unknown")
 
 
-def _list_payload() -> Dict[str, Any]:
-    """`list --json` payload: one entry per tracked manga, in list order."""
+# Issue #346: `list --sort` keys. "list" is the config order (the default).
+LIST_SORT_KEYS = ["list", "title", "status", "last-chapter", "downloaded"]
+
+
+def _list_sort_value(entry: Dict[str, Any], key: str):
+    """Sort value for one `list` entry, or None to always sort it last."""
+    if key == "title":
+        return entry["title"].casefold()
+    if key == "status":
+        status = entry["status"]
+        # Hand-edited unknown statuses have no rank, so they go last too.
+        return VALID_STATUSES.index(status) if status in VALID_STATUSES else None
+    if key == "last-chapter":
+        if entry["last_chapter"] is None:
+            return None
+        return _chapter_number(entry["last_chapter"])
+    if key == "downloaded":
+        return entry["downloaded_count"]
+    return entry["n"]
+
+
+def _list_entries(statuses=None, sort: str = "list", reverse: bool = False) -> List[Dict[str, Any]]:
+    """Entries for `list` and `list --json`, filtered and sorted.
+
+    `n` is always the position in the full list, so `#N` keeps working
+    with set/update/remove after filtering or sorting. Sorting is stable
+    with ties kept in list order, and entries without a value (unknown
+    status, no numeric last chapter) go last in either direction.
+    """
     entries = []
     for i, manga in enumerate(config.get("manga", []), 1):
         title = manga["title"]
@@ -234,7 +261,25 @@ def _list_payload() -> Dict[str, Any]:
             "sources": sources,
             "last_chapter": state.get_last_chapter(title),
             "downloaded_count": len(state.get_downloaded_chapters(title)),
+            "mode": manga.get("mode") or "auto",
+            "send_to_kindle": bool(manga.get("send_to_kindle", True)),
+            "backup_count": max(len(sources) - 1, 0),
         })
+    if statuses:
+        entries = [e for e in entries if e["status"] in statuses]
+    if sort != "list" or reverse:
+        valued = [(_list_sort_value(e, sort), e) for e in entries]
+        ranked = sorted(
+            (pair for pair in valued if pair[0] is not None),
+            key=lambda pair: pair[0], reverse=reverse,
+        )
+        entries = [e for _, e in ranked] + [e for v, e in valued if v is None]
+    return entries
+
+
+def _list_payload(statuses=None, sort: str = "list", reverse: bool = False) -> Dict[str, Any]:
+    """`list --json` payload: one entry per listed manga, in output order."""
+    entries = _list_entries(statuses, sort, reverse)
     return {
         "schema_version": JSON_SCHEMA_VERSION,
         "count": len(entries),
@@ -244,14 +289,20 @@ def _list_payload() -> Dict[str, Any]:
 
 def cmd_list(args):
     """List all tracked manga."""
+    statuses = getattr(args, "status", None)
+    sort = getattr(args, "sort", None) or "list"
+    reverse = getattr(args, "reverse", False)
     if getattr(args, "json", False):
-        _print_json(_list_payload())
+        _print_json(_list_payload(statuses, sort, reverse))
         return
 
-    manga_list = config.get("manga", [])
-    
-    if not manga_list:
+    if not config.get("manga", []):
         console.print("[dim]No manga tracked yet. Use [cyan]memanga add[/cyan] to add some![/dim]")
+        return
+
+    entries = _list_entries(statuses, sort, reverse)
+    if not entries:
+        console.print(f"[dim]No manga with status {_esc(', '.join(statuses))}.[/dim]")
         return
     
     table = Table(
@@ -265,19 +316,21 @@ def cmd_list(args):
     table.add_column("Source", style="green")
     table.add_column("Last Ch.", style="yellow", justify="center")
     table.add_column("Downloaded", style="magenta", justify="center")
-    
-    for i, manga in enumerate(manga_list, 1):
-        title = manga["title"]
-        last_ch = state.get_last_chapter(title)
-        downloaded = state.get_downloaded_chapters(title)
-        
+    # Issue #346: mode and the Kindle toggle share one stacked column so
+    # the table still fits 80 columns. Source's "(+N)" is the backup count.
+    table.add_column("Mode\nKindle", justify="center", no_wrap=True)
+
+    for entry in entries:
+        last_ch = entry["last_chapter"]
+
         table.add_row(
-            str(i),
-            _esc(title),
-            _get_status_display(manga),
-            _esc(_get_sources_display(manga)),
+            str(entry["n"]),
+            _esc(entry["title"]),
+            _get_status_display(entry),
+            _esc(entry["source_display"]),
             str(last_ch) if last_ch else "—",
-            str(len(downloaded)) if downloaded else "0",
+            str(entry["downloaded_count"]),
+            _esc(entry["mode"]) + "\n" + ("on" if entry["send_to_kindle"] else "off"),
         )
     
     console.print(table)
@@ -2246,6 +2299,14 @@ Examples:
     # list
     p_list = subparsers.add_parser("list", aliases=["ls"], help="List tracked manga")
     p_list.add_argument("--json", action="store_true", help="Machine-readable JSON output")
+    p_list.add_argument("--status", action="append", choices=VALID_STATUSES,
+                        help="Only show manga with this status (repeat for several)")
+    p_list.add_argument("--sort", choices=LIST_SORT_KEYS, default="list",
+                        help="Sort order (default: list, the order manga were added). "
+                             "Ties keep list order; # stays the list number for #N")
+    p_list.add_argument("--reverse", action="store_true",
+                        help="Reverse the sort; manga with no numeric last chapter "
+                             "or an unknown status stay last")
     p_list.set_defaults(func=cmd_list)
     
     # add
