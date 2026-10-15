@@ -976,6 +976,7 @@ run import memanga_export.json --replace
 |---------|-------------|
 | `run` | Open the interactive TUI |
 | `run list` | Show tracked manga with status and progress |
+| `run list --json` | Tracked manga as JSON (see [JSON output](#json-output)) |
 | `run add -i` | Add manga interactively |
 | `run add -t "Title" -u URL` | Add manga directly |
 | `run add -t "Title" -u URL -b BACKUP` | Add with backup source |
@@ -996,6 +997,12 @@ run import memanga_export.json --replace
 | `run update "Title" -t "New Name"` | Rename a manga |
 | `run config` | Configure settings (delivery, email, format) |
 | `run status` | Show overall status and config |
+| `run status --json` | Status and config as JSON, without secrets |
+| `run failed` | List failed and accepted-partial chapters |
+| `run failed -t "Title"` | Only manga whose title contains the text |
+| `run failed --retry` | Re-attempt every listed chapter |
+| `run failed --clear` | Forget the listed chapters |
+| `run failed --json` | Failed and partial chapters as JSON (listing only) |
 | `run sources` | List all supported sources |
 | `run cron install` | Set up daily automatic checks |
 | `run cron install --time 07:30` | Set custom check time |
@@ -1004,6 +1011,85 @@ run import memanga_export.json --replace
 | `run export` | Export manga list to JSON |
 | `run import FILE` | Import manga list from JSON |
 | `run import FILE --replace` | Import and replace all data |
+
+### JSON output
+
+With `--json`, `list`, `status` and `failed` print one JSON document to
+stdout and nothing else. Errors and warnings still go to stderr, so
+`memanga list --json | jq ...` is safe. Each payload has a top-level
+`schema_version` (currently `1`). New keys may be added within a
+version; it is bumped only when a key is renamed or removed or changes
+type, so ignore keys you don't use. Optional values are `null`, not
+missing.
+
+`list --json` keeps the order of `list`:
+
+```json
+{
+  "schema_version": 1,
+  "count": 1,
+  "manga": [
+    {
+      "n": 1,
+      "title": "Blue Lock",
+      "status": "reading",
+      "source": "mangadex.org",
+      "source_display": "mangadex.org (+1)",
+      "url": "https://mangadex.org/title/...",
+      "sources": [
+        {"source": "mangadex.org", "url": "https://mangadex.org/title/..."},
+        {"source": "mangapill.com", "url": "https://mangapill.com/manga/..."}
+      ],
+      "last_chapter": "251",
+      "downloaded_count": 12
+    }
+  ]
+}
+```
+
+`n` is the list number; pass it as `#N` to `set`, `update` or `remove`.
+`source` and `url` are the primary source (`null` if there is none),
+and `sources` lists the primary first, then backups. `last_chapter`
+is a string or `null`.
+
+`status --json` has the keys `paths` (`config_dir`, `config`, `state`),
+`manga_count`, `output_format`, `delivery` (`mode`, `download_dir`,
+`delete_after_send`), `email` (`kindle_email`, `sender_email`,
+`smtp_server`, `smtp_port`), `post_processing` (`enabled`,
+`fail_on_error`), `partial_chapters` (`enabled`, `threshold_percent`),
+`cron` (`enabled`, `time`) and `last_check` (ISO timestamp or `null`).
+The email app password is never included.
+
+`failed --json` has one entry per chapter, sorted by title and then by
+chapter number. `title_filter` is the `-t` value or `null`:
+
+```json
+{
+  "schema_version": 1,
+  "title_filter": null,
+  "count": 1,
+  "chapters": [
+    {
+      "title": "Vinland Saga",
+      "chapter": "10",
+      "status": "failed",
+      "recorded_at": "2026-01-01T06:00:00",
+      "source": "mangadex.org",
+      "failed_pages": [3],
+      "total_pages": null,
+      "attempts": 2,
+      "error": "HTTP 503"
+    }
+  ]
+}
+```
+
+`status` is `failed` or `partial`. If a chapter has both records, it is
+listed once as `failed`. `chapter` is always a string. `attempts` and
+`error` are `null` for partial chapters, and `total_pages` is `null`
+for failed ones. `failed --json` only lists: combining it with
+`--retry` or `--clear` is a usage error (exit code `2`) and changes
+nothing.
 
 ### Exit codes
 
