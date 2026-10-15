@@ -223,6 +223,106 @@ class TestAddFallbackDays:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# `add --status/--mode/--kindle` — per-manga policy fields (#347)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestAddPolicyFields:
+    @pytest.fixture(autouse=True)
+    def no_network(self, monkeypatch):
+        from memanga import cli
+        monkeypatch.setattr(cli, "get_scraper", lambda source: types.SimpleNamespace(
+            get_cover_url=lambda url: None))
+
+    def _add(self, run_cli, *flags):
+        return run_cli("add", "--title", "Policy Test",
+                       "--url", "https://mangadex.org/title/a/x", *flags)
+
+    def test_no_flags_keeps_legacy_entry_shape(self, run_cli, config):
+        assert self._add(run_cli) == 0
+        [entry] = config.get("manga", [])
+        assert entry == {"title": "Policy Test", "source": "mangadex.org",
+                         "url": "https://mangadex.org/title/a/x"}
+
+    @pytest.mark.parametrize("status", ["reading", "on-hold", "dropped", "completed"])
+    def test_status_is_saved(self, run_cli, config, status):
+        assert self._add(run_cli, "--status", status) == 0
+        [entry] = config.get("manga", [])
+        assert entry["status"] == status
+
+    @pytest.mark.parametrize("mode", ["auto", "manual"])
+    def test_mode_is_saved(self, run_cli, config, mode):
+        assert self._add(run_cli, "--mode", mode) == 0
+        [entry] = config.get("manga", [])
+        assert entry["mode"] == mode
+
+    @pytest.mark.parametrize(("flag", "expected"), [
+        ("--kindle", True), ("--no-kindle", False),
+    ])
+    def test_kindle_is_saved(self, run_cli, config, flag, expected):
+        assert self._add(run_cli, flag) == 0
+        [entry] = config.get("manga", [])
+        assert entry["send_to_kindle"] is expected
+
+    def test_all_fields_with_backup(self, run_cli, config):
+        assert self._add(run_cli, "--backup", "https://mangapill.com/manga/1/x",
+                         "--status", "on-hold", "--mode", "manual",
+                         "--no-kindle") == 0
+        [entry] = config.get("manga", [])
+        assert entry == {
+            "title": "Policy Test",
+            "fallback_delay_days": 2,
+            "sources": [
+                {"url": "https://mangadex.org/title/a/x"},
+                {"url": "https://mangapill.com/manga/1/x"},
+            ],
+            "status": "on-hold",
+            "mode": "manual",
+            "send_to_kindle": False,
+        }
+
+    def test_fields_show_in_list_json(self, run_cli, config, capsys):
+        assert self._add(run_cli, "--status", "completed", "--mode", "manual",
+                         "--no-kindle") == 0
+        capsys.readouterr()
+        assert run_cli("list", "--json") == 0
+        [item] = json.loads(capsys.readouterr().out)["manga"]
+        assert (item["status"], item["mode"], item["send_to_kindle"]) == (
+            "completed", "manual", False)
+
+    @pytest.mark.parametrize("existing", [False, True], ids=["new", "existing"])
+    @pytest.mark.parametrize(("flags", "message"), [
+        (("--status", "plan"), "--status"),
+        (("--status", "Reading"), "--status"),
+        (("--mode", "automatic"), "--mode"),
+        (("--kindle", "--no-kindle"), "not allowed with"),
+        (("--no-kindle", "--kindle"), "not allowed with"),
+    ])
+    def test_invalid_flags_do_not_write_config(self, run_cli, isolated_home,
+                                               capsys, flags, message, existing):
+        path = isolated_home / ".config" / "memanga" / "config.yaml"
+        before = b"# Keep this formatting\nmanga:\n  - title: Existing Manga\n"
+        if existing:
+            path.write_bytes(before)
+
+        assert self._add(run_cli, "--force", *flags) == 2
+        assert message in capsys.readouterr().err
+        if existing:
+            assert path.read_bytes() == before
+        else:
+            assert not path.exists()
+
+    def test_flags_do_not_bypass_duplicate(self, run_cli, isolated_home, capsys):
+        assert self._add(run_cli) == 0
+        path = isolated_home / ".config" / "memanga" / "config.yaml"
+        before = path.read_bytes()
+        assert self._add(run_cli, "--status", "dropped", "--no-kindle",
+                         "--force") == 1
+        assert "already exists" in capsys.readouterr().err
+        assert path.read_bytes() == before
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # `remove` / `rm`
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -2176,6 +2276,48 @@ class TestAddPrompts:
             "Unsafe\nhttps://unsupported.example/manga\nn\ny\n"))
         assert run_cli("add", "--interactive") == 0
         assert "Unsafe" in self._titles(config)
+
+    def test_interactive_does_not_dump_source_list(self, run_cli, config,
+                                                   monkeypatch, capsys):
+        monkeypatch.setattr(sys, "stdin", _TtyInput(
+            "Blue Lock\nhttps://mangadex.org/title/a/x\nn\n"))
+        assert run_cli("add", "--interactive") == 0
+        out = capsys.readouterr().out
+        assert "memanga sources" in out
+        assert "weebcentral.com" not in out
+
+    def test_unsupported_source_warning_does_not_dump_source_list(
+            self, run_cli, config, capsys):
+        assert run_cli("add", "--title", "Unsafe", "--force",
+                       "--url", "https://unsupported.example/manga") == 0
+        err = capsys.readouterr().err
+        assert "memanga sources" in err
+        assert "weebcentral.com" not in err
+
+    def test_interactive_applies_policy_flags_without_extra_prompts(
+            self, run_cli, config, monkeypatch):
+        # Only title, url and "no backup" are answered; any extra prompt
+        # would hit EOF and fail the command.
+        monkeypatch.setattr(sys, "stdin", _TtyInput(
+            "Blue Lock\nhttps://mangadex.org/title/a/x\nn\n"))
+        assert run_cli("add", "--interactive", "--status", "on-hold",
+                       "--mode", "manual", "--no-kindle") == 0
+        [entry] = config.get("manga", [])
+        assert (entry["status"], entry["mode"], entry["send_to_kindle"]) == (
+            "on-hold", "manual", False)
+
+    def test_flag_add_with_policy_on_tty_does_not_prompt(self, run_cli, config,
+                                                         monkeypatch):
+        stdin = _TtyInput("y\n")
+        monkeypatch.setattr(sys, "stdin", stdin)
+        assert run_cli("add", "--title", "Blue Lock",
+                       "--url", "https://mangadex.org/title/a/x",
+                       "--status", "completed", "--mode", "auto",
+                       "--kindle") == 0
+        assert stdin.read() == "y\n"
+        [entry] = config.get("manga", [])
+        assert (entry["status"], entry["mode"], entry["send_to_kindle"]) == (
+            "completed", "auto", True)
 
     def test_interactive_invalid_fallback_days_reprompts(self, run_cli, config,
                                                          monkeypatch, capsys):

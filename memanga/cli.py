@@ -365,8 +365,12 @@ def cmd_add(args):
         # Interactive mode
         console.print("\n[bold green]➕ Add New Manga[/bold green]\n")
         
-        sources = get_supported_sources()
-        console.print(f"[dim]Supported sources:[/dim] {_esc(', '.join(sources))}\n")
+        # Issue #347: hundreds of domains are unreadable here; point at
+        # `sources` instead of dumping them all.
+        console.print(
+            f"[dim]{len(get_supported_sources())} supported sources; "
+            f"run `memanga sources` to see them.[/dim]\n"
+        )
         
         title = Prompt.ask("📖 Manga title")
         if not title:
@@ -403,7 +407,7 @@ def cmd_add(args):
     source_ok = any(source == s or source.endswith("." + s) for s in supported)
     if not source_ok:
         err_console.print(f"[yellow]⚠️  Warning:[/yellow] '{_esc(source)}' might not be supported.")
-        err_console.print(f"[dim]Supported: {_esc(', '.join(supported))}[/dim]")
+        err_console.print("[dim]Run `memanga sources` to see supported sources.[/dim]")
         if not force:
             if not can_prompt:
                 return _non_interactive_error(
@@ -430,6 +434,18 @@ def cmd_add(args):
             "source": source,
             "url": url,
         }
+
+    # Issue #347: policy fields are written only when given, so a plain
+    # `add` keeps the legacy defaults (reading / auto / Kindle on).
+    status = getattr(args, 'status', None)
+    mode = getattr(args, 'mode', None)
+    kindle = getattr(args, 'send_to_kindle', None)
+    if status is not None:
+        manga_entry["status"] = status
+    if mode is not None:
+        manga_entry["mode"] = mode
+    if kindle is not None:
+        manga_entry["send_to_kindle"] = kindle
     
     # Try to fetch cover URL from the manga page
     if source_ok:
@@ -2316,7 +2332,17 @@ Examples:
     p_add.add_argument("-b", "--backup", help="Backup source URL")
     p_add.add_argument("--fallback-days", type=_non_negative_int_arg, default=2,
                        help="Days to wait before using backup (0 or more; default: 2)")
-    p_add.add_argument("-i", "--interactive", action="store_true", help="Interactive mode")
+    p_add.add_argument("--status", choices=VALID_STATUSES,
+                       help="Initial status (default: reading)")
+    p_add.add_argument("--mode", choices=["auto", "manual"],
+                       help="Desktop-app download mode (default: auto)")
+    p_add_kindle = p_add.add_mutually_exclusive_group()
+    p_add_kindle.add_argument("--kindle", dest="send_to_kindle", action="store_const", const=True,
+                              help="Turn the desktop app's per-manga Kindle toggle on (default)")
+    p_add_kindle.add_argument("--no-kindle", dest="send_to_kindle", action="store_const", const=False,
+                              help="Turn the desktop app's per-manga Kindle toggle off")
+    p_add.add_argument("-i", "--interactive", action="store_true",
+                       help="Interactive mode (--status, --mode and --kindle/--no-kindle still apply)")
     p_add.add_argument("-f", "--force", "-y", "--yes", dest="force", action="store_true",
                        help="Add even if the source might be unsupported or a similar title is tracked")
     p_add.set_defaults(func=cmd_add)
