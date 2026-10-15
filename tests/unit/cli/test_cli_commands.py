@@ -1409,6 +1409,7 @@ class TestListJson:
             "url": "https://mangadex.org/t/1",
             "sources": [{"source": "mangadex.org", "url": "https://mangadex.org/t/1"}],
             "last_chapter": None, "downloaded_count": 0,
+            "mode": "auto", "send_to_kindle": True, "backup_count": 0,
         }
         assert multi["status"] == "on-hold"
         assert multi["source"] == "mangapill.com"
@@ -1416,6 +1417,154 @@ class TestListJson:
         assert len(multi["sources"]) == 2
         assert multi["last_chapter"] == "2"
         assert multi["downloaded_count"] == 2
+        assert multi["backup_count"] == 1
+
+
+class TestListFilterSort:
+    """Issue #346: list --status / --sort / --reverse and richer fields."""
+
+    @pytest.fixture
+    def library(self, config, cli_state, capsys):
+        config.set("manga", [
+            {"title": "beta", "status": "completed", "mode": "manual",
+             "send_to_kindle": False, "sources": [
+                 {"source": "mangadex.org", "url": "https://mangadex.org/t/b"},
+                 {"source": "mangapill.com", "url": "https://mangapill.com/m/b"},
+                 {"url": "https://comick.io/comic/b"},
+             ]},
+            {"title": "Alpha", "source": "mangadex.org",
+             "url": "https://mangadex.org/t/a"},
+            {"title": "gamma", "status": "on-hold",
+             "sources": [{"url": "https://mangadex.org/t/g"}]},
+            {"title": "Delta", "status": "reading",
+             "sources": [{"url": "https://mangadex.org/t/d"}]},
+        ])
+        config.save()
+        for ch in ("1", "2", "10"):
+            cli_state.add_downloaded_chapter("beta", ch)
+        cli_state.add_downloaded_chapter("Delta", "9.5")
+        cli_state.save()
+        capsys.readouterr()
+
+    def _titles(self, run_cli, capsys, *flags):
+        assert run_cli("list", "--json", *flags) == 0
+        payload = _stdout_json(capsys)
+        assert payload["count"] == len(payload["manga"])
+        return [m["title"] for m in payload["manga"]]
+
+    def test_default_is_list_order(self, run_cli, library, capsys):
+        assert self._titles(run_cli, capsys) == ["beta", "Alpha", "gamma", "Delta"]
+        assert self._titles(run_cli, capsys, "--sort", "list") == [
+            "beta", "Alpha", "gamma", "Delta"]
+
+    def test_richer_fields(self, run_cli, library, capsys):
+        assert run_cli("list", "--json") == 0
+        beta, alpha, gamma, _ = _stdout_json(capsys)["manga"]
+        assert (beta["mode"], beta["send_to_kindle"], beta["backup_count"]) == (
+            "manual", False, 2)
+        # Legacy single-source record: defaults, no backups.
+        assert (alpha["mode"], alpha["send_to_kindle"], alpha["backup_count"]) == (
+            "auto", True, 0)
+        assert alpha["status"] == "reading"
+        assert gamma["backup_count"] == 0
+
+    def test_status_filter_keeps_list_numbers(self, run_cli, library, capsys):
+        assert run_cli("list", "--json", "--status", "reading") == 0
+        payload = _stdout_json(capsys)
+        assert payload["count"] == 2
+        assert [(m["n"], m["title"]) for m in payload["manga"]] == [
+            (2, "Alpha"), (4, "Delta")]
+
+    def test_status_filter_repeatable(self, run_cli, library, capsys):
+        assert self._titles(run_cli, capsys, "--status", "completed",
+                            "--status", "on-hold") == ["beta", "gamma"]
+
+    def test_status_filter_no_match(self, run_cli, library, capsys):
+        assert run_cli("list", "--json", "--status", "dropped") == 0
+        assert _stdout_json(capsys) == {"schema_version": 1, "count": 0, "manga": []}
+
+    def test_invalid_status_is_usage_error(self, run_cli, library, capsys):
+        assert run_cli("list", "--status", "paused") == 2
+        assert "invalid choice" in capsys.readouterr().err
+
+    def test_invalid_sort_is_usage_error(self, run_cli, library, capsys):
+        assert run_cli("list", "--sort", "rating") == 2
+        assert "invalid choice" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("key,expected", [
+        ("title", ["Alpha", "beta", "Delta", "gamma"]),
+        # reading < on-hold < dropped < completed; ties keep list order.
+        ("status", ["Alpha", "Delta", "gamma", "beta"]),
+        # Numeric, not string, order (10 > 9.5); no chapter goes last.
+        ("last-chapter", ["Delta", "beta", "Alpha", "gamma"]),
+        ("downloaded", ["Alpha", "gamma", "Delta", "beta"]),
+    ])
+    def test_sort_keys(self, run_cli, library, capsys, key, expected):
+        assert self._titles(run_cli, capsys, "--sort", key) == expected
+
+    @pytest.mark.parametrize("key,expected", [
+        ("list", ["Delta", "gamma", "Alpha", "beta"]),
+        ("title", ["gamma", "Delta", "beta", "Alpha"]),
+        ("last-chapter", ["beta", "Delta", "Alpha", "gamma"]),
+        # Ties (Alpha, gamma = 0) stay in list order when reversed.
+        ("downloaded", ["beta", "Delta", "Alpha", "gamma"]),
+    ])
+    def test_reverse(self, run_cli, library, capsys, key, expected):
+        assert self._titles(run_cli, capsys, "--sort", key, "--reverse") == expected
+
+    @pytest.mark.parametrize("flags,expected", [
+        ((), ["Delta", "gamma", "beta", "Alpha"]),
+        (("--reverse",), ["beta", "gamma", "Delta", "Alpha"]),
+    ])
+    def test_sort_status_unknown_goes_last(self, run_cli, library, config,
+                                           capsys, flags, expected):
+        # A hand-edited status outside VALID_STATUSES has no rank.
+        manga = config.get("manga")
+        manga[1]["status"] = "paused"
+        config.set("manga", manga)
+        config.save()
+        assert self._titles(run_cli, capsys, "--sort", "status", *flags) == expected
+
+    @pytest.mark.parametrize("flags,expected", [
+        ((), ["Delta", "beta", "Alpha", "gamma"]),
+        (("--reverse",), ["beta", "Delta", "Alpha", "gamma"]),
+    ])
+    def test_sort_last_chapter_nonnumeric_goes_last(self, run_cli, library,
+                                                     cli_state, capsys,
+                                                     flags, expected):
+        cli_state.set_last_chapter("gamma", "Extra")
+        cli_state.save()
+        assert run_cli("list", "--json", "--sort", "last-chapter", *flags) == 0
+        manga = _stdout_json(capsys)["manga"]
+        assert [m["title"] for m in manga] == expected
+        assert manga[-1]["last_chapter"] == "Extra"
+
+    def test_filter_and_sort_combine(self, run_cli, library, capsys):
+        assert self._titles(run_cli, capsys, "--status", "reading",
+                            "--sort", "title", "--reverse") == ["Delta", "Alpha"]
+
+    def test_table_shows_new_columns_and_list_numbers(self, run_cli, library, capsys):
+        assert run_cli("list", "--sort", "title", "--status", "completed",
+                       "--status", "reading") == 0
+        out = capsys.readouterr().out
+        for header in ("Status", "Mode", "Kindle"):
+            assert header in out
+        lines = out.splitlines()
+        # Mode and Kindle are stacked in one column: mode, then on/off below.
+        i = next(i for i, line in enumerate(lines) if "beta" in line)
+        assert "completed" in lines[i] and "manual" in lines[i]
+        assert lines[i].split("│")[1].strip() == "1"
+        assert "off" in lines[i + 1]
+        assert "(+2)" in out  # backup count, in the Source column
+        i = next(i for i, line in enumerate(lines) if "Alpha" in line)
+        assert "auto" in lines[i] and " on " in lines[i + 1]
+        assert lines[i].split("│")[1].strip() == "2"
+        assert out.index("Alpha") < out.index("beta") < out.index("Delta")
+        assert "gamma" not in out
+
+    def test_table_filter_no_match(self, run_cli, library, capsys):
+        assert run_cli("list", "--status", "dropped") == 0
+        assert "No manga with status dropped" in capsys.readouterr().out
 
 
 class TestStatusJson:

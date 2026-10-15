@@ -391,12 +391,16 @@ run list
 Output:
 
 ```
-┌───┬───────────────┬─────────┬────────────────────────────┬──────────┬────────────┐
-│ # │ Title         │ Status  │ Source                     │ Last Ch. │ Downloaded │
-├───┼───────────────┼─────────┼────────────────────────────┼──────────┼────────────┤
-│ 1 │ One Piece     │ reading │ tcbonepiecechapters.com    │ —        │ 0          │
-│ 2 │ Solo Leveling │ reading │ mangafire.to (+1)          │ —        │ 0          │
-└───┴───────────────┴─────────┴────────────────────────────┴──────────┴────────────┘
+┌───┬───────────────┬─────────┬────────────────────────────┬──────────┬────────────┬────────┐
+│ # │ Title         │ Status  │ Source                     │ Last Ch. │ Downloaded │  Mode  │
+│   │               │         │                            │          │            │ Kindle │
+├───┼───────────────┼─────────┼────────────────────────────┼──────────┼────────────┼────────┤
+│ 1 │ One Piece     │ reading │ tcbonepiecechapters.com    │ —        │ 0          │  auto  │
+│   │               │         │                            │          │            │   on   │
+├───┼───────────────┼─────────┼────────────────────────────┼──────────┼────────────┼────────┤
+│ 2 │ Solo Leveling │ reading │ mangafire.to (+1)          │ —        │ 0          │  auto  │
+│   │               │         │                            │          │            │   on   │
+└───┴───────────────┴─────────┴────────────────────────────┴──────────┴────────────┴────────┘
 ```
 
 ### Remove a manga
@@ -977,6 +981,9 @@ run import memanga_export.json --replace
 | `run` | Open the interactive TUI |
 | `run list` | Show tracked manga with status and progress |
 | `run list --json` | Tracked manga as JSON (see [JSON output](#json-output)) |
+| `run list --status reading` | Only one status (repeat `--status` for several) |
+| `run list --sort title` | Sort by `list` (default), `title`, `status`, `last-chapter` or `downloaded` |
+| `run list --sort downloaded --reverse` | Reverse the sort order |
 | `run add -i` | Add manga interactively |
 | `run add -t "Title" -u URL` | Add manga directly |
 | `run add -t "Title" -u URL -b BACKUP` | Add with backup source |
@@ -1022,7 +1029,8 @@ version; it is bumped only when a key is renamed or removed or changes
 type, so ignore keys you don't use. Optional values are `null`, not
 missing.
 
-`list --json` keeps the order of `list`:
+`list --json` keeps the order of `list`, including any `--status`
+filter and `--sort` order, and `count` is the number of entries shown:
 
 ```json
 {
@@ -1041,16 +1049,30 @@ missing.
         {"source": "mangapill.com", "url": "https://mangapill.com/manga/..."}
       ],
       "last_chapter": "251",
-      "downloaded_count": 12
+      "downloaded_count": 12,
+      "mode": "auto",
+      "send_to_kindle": true,
+      "backup_count": 1
     }
   ]
 }
 ```
 
 `n` is the list number; pass it as `#N` to `set`, `update` or `remove`.
+It stays the same when `--status` or `--sort` hide or reorder entries.
 `source` and `url` are the primary source (`null` if there is none),
 and `sources` lists the primary first, then backups. `last_chapter`
-is a string or `null`.
+is a string or `null`. `mode` is `auto` or `manual`, `send_to_kindle`
+is the per-manga Kindle toggle (email delivery must also be on), and
+`backup_count` is the number of sources after the primary (shown as
+`(+N)` in the table's Source column).
+
+`--sort` orders `title` case-insensitively, `status` as reading,
+on-hold, dropped, completed, `last-chapter` numerically and
+`downloaded` by count, all ascending; `--reverse` flips it. Ties keep
+list order, and manga without a numeric last chapter (under
+`last-chapter`) or with an unknown status (under `status`) always come
+last.
 
 `status --json` has the keys `paths` (`config_dir`, `config`, `state`),
 `manga_count`, `output_format`, `delivery` (`mode`, `download_dir`,
