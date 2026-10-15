@@ -394,7 +394,7 @@ def cmd_add(args):
     for m in manga_list:
         if m["title"].lower() == title.lower():
             err_console.print(f"[yellow]⚠️  '{_esc(title)}' already exists![/yellow]")
-            return
+            return EXIT_ERROR
 
     # Check for similar titles (substring match)
     new_lower = title.lower()

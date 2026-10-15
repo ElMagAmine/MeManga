@@ -1018,6 +1018,9 @@ cron jobs can rely on these exit codes:
 | `3` | `check` or `failed --retry` ran, but some chapters (or some manga's source checks) failed |
 | `130` | Interrupted with Ctrl-C |
 
+An exact title duplicate (ignoring case) is refused by `add` with exit code
+`1`, including with `--force` or `--yes`. The existing entry is preserved.
+
 ---
 
 ## Troubleshooting — Windows
