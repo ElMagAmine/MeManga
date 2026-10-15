@@ -2,42 +2,85 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
+import requests
+
+from memanga import __version__
+from memanga.scrapers.base import BaseScraper
 
 from memanga.scrapers.mangadex import MangaDexScraper
 
 
 @pytest.fixture
 def scraper():
-    return MangaDexScraper()
+    instance = MangaDexScraper()
+    yield instance
+    instance.session.close()
 
 
 class TestSessionHeaders:
-    """MangaDex's API returns HTTP 400 for a browser-style User-Agent that
-    omits Sec-Fetch-* metadata. The scraper must send those headers (and ask
-    for JSON) on every request via the shared session."""
+    """Identify the API client at the outgoing transport boundary."""
 
-    def test_sends_sec_fetch_and_json_accept(self, scraper):
-        headers = scraper.session.headers
-        assert headers["Accept"] == "application/json"
-        assert headers["Sec-Fetch-Dest"] == "empty"
-        assert headers["Sec-Fetch-Mode"] == "cors"
-        assert headers["Sec-Fetch-Site"] == "same-origin"
+    @pytest.mark.parametrize("operation,fixture,path", [
+        ("search", "search.json", "/manga"),
+        ("get_chapters", "feed.json", "/manga/11111111-1111-1111-1111-111111111111/feed"),
+        ("get_pages", "server.json", "/at-home/server/deadbeef-1234"),
+    ])
+    def test_identifies_client_on_api_requests(self, scraper, load_json_fixture,
+                                               operation, fixture, path):
+        seen = []
+        payload = load_json_fixture("mangadex", fixture)
 
-    def test_headers_reach_the_request(self, monkeypatch, scraper, fake_response):
-        seen = {}
+        class Capture(requests.adapters.BaseAdapter):
+            def send(self, request, **kwargs):
+                seen.append(request)
+                response = requests.Response()
+                response.status_code = 200
+                response._content = json.dumps(payload).encode()
+                response.request = request
+                response.url = request.url
+                return response
 
-        def fake_get(url, **kwargs):
-            # session.headers are merged into the request by requests itself,
-            # so assert against the session that will be used for the call.
-            seen["headers"] = dict(scraper.session.headers)
-            return fake_response(json_data={"data": []})
+            def close(self):
+                pass
 
-        monkeypatch.setattr(scraper.session, "get", fake_get)
-        scraper.search("one piece")
+        scraper.session.trust_env = False
+        scraper.session.mount("https://", Capture())
+        argument = {
+            "search": "chainsaw",
+            "get_chapters": "https://mangadex.org/title/11111111-1111-1111-1111-111111111111",
+            "get_pages": "https://mangadex.org/chapter/deadbeef-1234",
+        }[operation]
+        assert getattr(scraper, operation)(argument)
+        assert len(seen) == 1
+        request = seen[0]
+        assert request.method == "GET"
+        assert request.url.split("?")[0] == f"https://api.mangadex.org{path}"
+        assert request.headers["Accept"] == "application/json"
+        assert request.headers["User-Agent"] == (
+            f"MeManga/{__version__} (+https://github.com/meellm/MeManga)"
+        )
+        assert not any(key.lower().startswith("sec-fetch-") for key in request.headers)
 
-        assert seen["headers"]["Accept"] == "application/json"
-        assert seen["headers"]["Sec-Fetch-Mode"] == "cors"
+    def test_other_scrapers_keep_browser_identity(self):
+        class OtherScraper(BaseScraper):
+            def search(self, query):
+                return []
+
+            def get_chapters(self, manga_url):
+                return []
+
+            def get_pages(self, chapter_url):
+                return []
+
+        other = OtherScraper()
+        try:
+            assert "Mozilla/" in other.session.headers["User-Agent"]
+            assert other.session.headers["Accept"] != "application/json"
+        finally:
+            other.session.close()
 
 
 class TestExtractIDs:

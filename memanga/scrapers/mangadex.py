@@ -4,6 +4,7 @@ https://api.mangadex.org/docs/
 """
 
 from typing import List, Optional
+from memanga import __version__
 from .base import BaseScraper, Chapter, Manga
 
 
@@ -17,16 +18,11 @@ class MangaDexScraper(BaseScraper):
         super().__init__()
         self._rate_limit = 0.5  # MangaDex is generous with rate limits
 
-        # The MangaDex API rejects requests with HTTP 400 when the session
-        # claims a modern Chrome User-Agent (inherited from BaseScraper) but
-        # omits the Sec-Fetch-* metadata headers a real browser always sends
-        # for such requests. Send the values a browser uses for a same-origin
-        # fetch/XHR to the API, and ask for JSON explicitly.
+        # MangaDex requires an honest client User-Agent, not browser identity
+        # or browser-only Fetch Metadata: https://api.mangadex.org/docs/2-limitations/
         self.session.headers.update({
+            "User-Agent": f"MeManga/{__version__} (+https://github.com/meellm/MeManga)",
             "Accept": "application/json",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
         })
     
     def _extract_manga_id(self, url: str) -> Optional[str]:
