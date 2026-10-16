@@ -910,7 +910,17 @@ def cmd_update(args):
 
 
 def cmd_check(args):
-    """Check for new chapters and download."""
+    """Check for new chapters and download them.
+
+    Modes (#351):
+      - ``--dry-run``: check only. Lists what a download run would fetch;
+        never downloads, delivers or changes state. Wins over every
+        download flag.
+      - ``--download`` (aliases ``--auto``/``--yes``): download without
+        prompting.
+      - otherwise: ask per chapter on a terminal. Without a terminal, or
+        with ``--quiet``, nothing is downloaded and the run exits 1.
+    """
     manga_list = config.get("manga", [])
     
     if not manga_list and not args.title:
@@ -928,11 +938,20 @@ def cmd_check(args):
     if getattr(args, 'all', False):
         from_chapter = 0
     dry_run = getattr(args, 'dry_run', False)
+    # `--auto`/`--yes` are aliases of `--download`; programmatic callers
+    # (the TUI) may still pass the old attribute names.
+    download = (
+        getattr(args, 'download', False)
+        or getattr(args, 'auto', False)
+        or getattr(args, 'yes', False)
+    )
+    # --quiet never prompts; it is not permission to download.
+    can_prompt = _stdin_is_tty() and not getattr(args, 'quiet', False)
 
     console.print(f"[dim]=== {datetime.now().strftime('%Y-%m-%d %H:%M')} ===[/dim]")
 
     if dry_run:
-        console.print(Panel("[bold]🔍 Dry Run — Checking for New Chapters[/bold]", border_style="yellow"))
+        console.print(Panel("[bold]🔍 Dry Run — Check Only (nothing is downloaded or recorded)[/bold]", border_style="yellow"))
     elif from_chapter is not None and from_chapter == 0:
         console.print(Panel("[bold]📥 Downloading All Chapters[/bold]", border_style="green"))
     elif from_chapter is not None:
@@ -949,7 +968,6 @@ def cmd_check(args):
     total_errored = 0
     # Chapters left undownloaded because no one could confirm them (#258).
     total_unconfirmed = 0
-    interactive = _stdin_is_tty()
 
     delivery_mode = config.delivery_mode
     download_dir = config.download_dir
@@ -982,15 +1000,23 @@ def cmd_check(args):
         
         try:
             force_suspicious = getattr(args, 'force_suspicious', False)
-            new_chapters = check_for_updates(
-                manga, state,
+            check_kwargs = dict(
                 from_chapter=from_chapter,
                 force_suspicious=force_suspicious,
             )
+            report = {}
+            if dry_run:
+                check_kwargs.update(dry_run=True, report=report)
+            new_chapters = check_for_updates(manga, state, **check_kwargs)
 
             # A batch that doesn't fit this manga's history was withheld
-            # because it couldn't be confirmed by a backup source.
-            suspicious = state.get_suspicious_batch(title) if from_chapter is None else None
+            # because it couldn't be confirmed by a backup source. A dry run
+            # records nothing, so report what this preview decided rather
+            # than a persisted record it would have cleared or replaced.
+            if dry_run:
+                suspicious = report.get("withheld")
+            else:
+                suspicious = state.get_suspicious_batch(title) if from_chapter is None else None
             if suspicious:
                 err_console.print(
                     f"  [yellow]└─ Warning: Suspicious chapter batch detected: "
@@ -1001,9 +1027,21 @@ def cmd_check(args):
                 for reason in suspicious.get("reasons", []):
                     err_console.print(f"     [dim]- {_esc(reason)}[/dim]")
                 err_console.print(f"     [dim]- {_esc(suspicious.get('backup_status'))}[/dim]")
+                if dry_run:
+                    err_console.print(
+                        "     [yellow]A download run would skip these chapters. Run "
+                        "'memanga check --download --force-suspicious' to accept anyway.[/yellow]"
+                    )
+                else:
+                    err_console.print(
+                        "     [yellow]Skipped auto-delivery. Run "
+                        "'memanga check --force-suspicious' to accept anyway.[/yellow]"
+                    )
+            elif dry_run and report.get("forced"):
                 err_console.print(
-                    "     [yellow]Skipped auto-delivery. Run "
-                    "'memanga check --force-suspicious' to accept anyway.[/yellow]"
+                    f"  [yellow]└─ --force-suspicious: includes {_esc(report['forced'])} "
+                    "chapter(s) from a suspicious batch; a download run with "
+                    "this flag would accept it.[/yellow]"
                 )
 
             if not new_chapters:
@@ -1027,16 +1065,16 @@ def cmd_check(args):
                     if isinstance(ch, ChapterWithSource) and ch.is_backup:
                         source_info = f" [yellow](backup: {_esc(ch.source)})[/yellow]"
                     console.print(f"     [dim][DRY RUN][/dim] {ch_label}{source_info}")
-                    total_downloaded += 1
                     continue
 
                 # Download automatically or prompt
-                should_download = args.auto or args.yes
-                if not should_download and not interactive:
-                    # Even --quiet must not hide missing input (#258).
+                should_download = download
+                if not should_download and not can_prompt:
+                    # No one can confirm: no terminal, or --quiet. Never
+                    # download implicitly and never hide it (#258, #351).
                     total_unconfirmed += 1
                     continue
-                if not should_download and not args.quiet:
+                if not should_download:
                     should_download = Confirm.ask(f"     Download {ch_label}?", default=True)
 
                 if not should_download:
@@ -1249,8 +1287,10 @@ def cmd_check(args):
             err_console.print(f"  [red]└─ Unexpected error: {_esc(e)}[/red]")
             total_errored += 1
     
-    # Record check history with actual counts
-    state.update_last_check(new_chapters=total_new, downloaded=total_downloaded)
+    # Record check history with actual counts. A dry run is a preview:
+    # it must not count as a check (the GUI auto-check throttles on it).
+    if not dry_run:
+        state.update_last_check(new_chapters=total_new, downloaded=total_downloaded)
 
     # Summary
     console.print()
@@ -1269,7 +1309,8 @@ def cmd_check(args):
     if total_unconfirmed:
         return _non_interactive_error(
             f"skipped {total_unconfirmed} chapter(s) that need confirmation; "
-            "pass --auto or --yes to download without prompting"
+            "pass --download (or its aliases --auto/--yes) to download without "
+            "prompting, or --dry-run to only list them"
         )
     # Issue #239: nothing could be checked is an error; some chapters or
     # manga failing while the rest ran is a partial failure.
@@ -2495,7 +2536,8 @@ Examples:
   memanga add -t "Solo Leveling" -u URL # Add manga directly
   memanga search "Blue Lock"            # Find a manga across sources
   memanga check                         # Check for new chapters
-  memanga check --auto                  # Auto-download new chapters
+  memanga check --download              # Download new chapters, no prompts
+  memanga check --dry-run               # Only list new chapters
   memanga doctor                        # Diagnose setup problems
   memanga cron install                  # Set up daily checks
   memanga config                        # Configure settings
@@ -2609,15 +2651,37 @@ Examples:
     p_update.set_defaults(func=cmd_update)
 
     # check
-    p_check = subparsers.add_parser("check", help="Check for new chapters")
+    p_check = subparsers.add_parser(
+        "check",
+        help="Check for new chapters",
+        description=(
+            "Check tracked manga for new chapters.\n\n"
+            "Modes:\n"
+            "  check --dry-run    check only: list what a download run would fetch;\n"
+            "                     never downloads, delivers or changes state\n"
+            "  check --download   download without prompting (--auto and --yes are\n"
+            "                     aliases; scheduled runs use 'check --auto --quiet')\n"
+            "  check              ask per chapter on a terminal; without a terminal,\n"
+            "                     or with --quiet, download nothing and exit 1\n\n"
+            "--dry-run wins over --download. --all and --from choose where to start;\n"
+            "they don't download by themselves.\n\n"
+            "Exit codes: 0 no new chapters, chapters listed or all downloaded, or a\n"
+            "suspicious batch withheld (warning on stderr); 1 every checked manga\n"
+            "failed, the target was not found, or chapters needed confirmation;\n"
+            "2 usage error; 3 some chapters or manga failed; 130 interrupted."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_check.add_argument("-t", "--title", help="Check one manga only (title, or #N from 'memanga list')")
     p_check.add_argument("-f", "--from", dest="from_chapter", type=float, help="Start from chapter N (for fresh downloads)")
-    p_check.add_argument("--all", action="store_true", help="Download all chapters from the beginning")
-    p_check.add_argument("-a", "--auto", action="store_true", help="Auto-download without prompts")
-    p_check.add_argument("-y", "--yes", action="store_true", help="Say yes to all prompts")
-    p_check.add_argument("-q", "--quiet", action="store_true", help="Minimal output (for cron)")
+    p_check.add_argument("--all", action="store_true", help="Start from the first chapter (backfill; skips the suspicious-batch check)")
+    p_check.add_argument("--download", "-a", "--auto", "-y", "--yes", dest="download", action="store_true",
+                         help="Download new chapters without prompting (--auto and --yes are aliases)")
+    p_check.add_argument("-q", "--quiet", action="store_true",
+                         help="Never prompt; without --download, new chapters are skipped and the run exits 1")
     p_check.add_argument("-s", "--safe", action="store_true", help="Safe mode: restart browser every 3 chapters (for bulk downloads)")
-    p_check.add_argument("-n", "--dry-run", action="store_true", help="List new chapters without downloading")
+    p_check.add_argument("-n", "--dry-run", action="store_true",
+                         help="Check only: list what would be downloaded; no downloads or state changes (wins over --download)")
     p_check.add_argument("--force-suspicious", action="store_true", help="Accept a chapter batch even if it was flagged as suspicious")
     p_check.add_argument("--format", choices=["pdf", "epub", "cbz", "zip", "jpg", "png", "webp"], help="Output format (overrides config)")
     p_check.add_argument("--retries", type=int, default=3, metavar="N", help="Retry failed page downloads N times (default: 3, 0 to disable)")

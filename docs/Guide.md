@@ -397,7 +397,7 @@ run add -t "Blue Lock" -u "https://mangadex.org/title/uuid-here" --status on-hol
 `--kindle` and `--no-kindle` cannot be combined. `--mode` and the Kindle
 toggle are the same per-manga settings shown on the desktop app's manga page,
 and both are honored by the desktop app (the Kindle toggle only matters when
-email delivery is enabled). CLI `check --auto` and cron currently still
+email delivery is enabled). CLI `check --download` and cron currently still
 process every `reading` manga regardless of these per-manga mode and Kindle
 settings. Omitted flags are not written to `config.yaml`, so the defaults
 above apply. Invalid values are rejected before any config is saved. These
@@ -500,13 +500,37 @@ That's it — MeManga checks all your manga and downloads new chapters automatic
 These are the command-line equivalents if you prefer typing commands directly in your terminal (not inside the menu):
 
 ```bash
-run check                        # Interactive — asks y/n per chapter
-run check --auto                 # Auto-download all new chapters
-run check -t "One Piece"        # Check one specific manga
-run check -t "One Piece" --auto # Auto-download for one manga
-run check --dry-run              # Preview what's new without downloading
-run check --auto --quiet         # Quiet mode (for scripts and cron)
+run check                            # Interactive — asks y/n per chapter
+run check --download                 # Download all new chapters without asking
+run check -t "One Piece"             # Check one specific manga
+run check -t "One Piece" --download  # Download new chapters for one manga
+run check --dry-run                  # Check only: list what's new, change nothing
+run check --auto --quiet             # What scheduled checks run (never prompts)
 ```
+
+### Check modes
+
+`check` runs in one of three modes:
+
+| Mode | How to pick it | What happens |
+|------|----------------|--------------|
+| Check only | `--dry-run` (`-n`) | Lists the chapters a download run would fetch, with the same backup-delay and suspicious-batch rules. Nothing is downloaded, emailed or post-processed, and nothing is saved: no check history or last-check time, no backup-delay clock, no suspicious-batch record or notification, and a held batch stays held. `--dry-run` wins over `--download` and its aliases. |
+| Download | `--download` (aliases `-a`/`--auto` and `-y`/`--yes`) | Downloads every new chapter without asking. |
+| Ask | neither flag | On a terminal, asks once per chapter. Without a terminal (cron, pipes, CI), or with `--quiet`, it downloads nothing and exits `1` with a hint. |
+
+`--auto` and `--yes` keep working and are not deprecated; existing cron
+lines such as `check --auto --quiet` behave as before. `--quiet` only
+means "never prompt"; it doesn't give permission to download and doesn't
+shorten the output. `--all` and `--from N` choose where to start
+(`--all` is `--from 0`); they don't download anything without
+`--download`, and they skip the suspicious-batch check, so preview them
+with `--dry-run` first.
+
+A suspicious batch (a sudden jump in chapter numbers that no backup
+source confirms) is withheld, and the run still exits `0` with a warning
+on stderr. Run `check --download --force-suspicious` to accept it. With
+`--dry-run --force-suspicious` the preview shows what accepting it would
+download, but the batch stays held.
 
 ---
 
@@ -530,7 +554,7 @@ That's all you need. MeManga downloads every chapter from chapter 1 onward. Safe
 The command-line equivalent, typed directly in your terminal (not inside the menu):
 
 ```bash
-run check -t "One Piece" --from 1 --auto --safe
+run check -t "One Piece" --from 1 --download --safe
 ```
 
 **What each flag does:**
@@ -539,7 +563,7 @@ run check -t "One Piece" --from 1 --auto --safe
 |------|---------|
 | `-t "One Piece"` | Target a specific manga |
 | `--from 1` | Start from chapter 1 instead of where you left off |
-| `--auto` | Download without prompting for each chapter |
+| `--download` | Download without prompting for each chapter (`--auto` and `--yes` are aliases) |
 | `--safe` | Restart the browser every 3 chapters to prevent memory buildup |
 
 The `--safe` flag is important for bulk downloads — without it, the browser can consume too much memory after many chapters.
@@ -564,19 +588,19 @@ This downloads chapter 50, 51, 52, etc. Chapters you already have are automatica
 ### Using CLI commands
 
 ```bash
-run check -t "One Piece" --from 50 --auto --safe
+run check -t "One Piece" --from 50 --download --safe
 ```
 
 Start from chapter 100 in EPUB format:
 
 ```bash
-run check -t "One Piece" --from 100 --auto --safe --format epub
+run check -t "One Piece" --from 100 --download --safe --format epub
 ```
 
 Start from a decimal chapter:
 
 ```bash
-run check -t "One Piece" --from 55.5 --auto
+run check -t "One Piece" --from 55.5 --download
 ```
 
 ---
@@ -679,7 +703,7 @@ run check --format epub
 Download one manga in CBZ:
 
 ```bash
-run check -t "One Piece" --format cbz --auto
+run check -t "One Piece" --format cbz --download
 ```
 
 ---
@@ -813,7 +837,7 @@ The app password is stored in your system keyring when available. If the keyring
 ### Step 4 — Test it
 
 ```bash
-run check --auto
+run check --download
 ```
 
 When a new chapter is found and downloaded, MeManga sends it to your Kindle automatically. If the PDF exceeds 23MB, it's automatically split into smaller parts.
@@ -1087,12 +1111,12 @@ run import memanga_export.json --replace
 | `run add -t "Title" -u URL -b BACKUP` | Add with backup source |
 | `run add -t "Title" -u URL --status on-hold --mode manual --no-kindle` | Add with status, mode and Kindle setting |
 | `run check` | Check for new chapters (interactive) |
-| `run check --auto` | Auto-download all new chapters |
+| `run check --download` | Download all new chapters without asking (`--auto`, `--yes` are aliases) |
 | `run check -t "Title"` | Check one manga |
-| `run check -t "Title" --from 1 --auto --safe` | Download from chapter 1 |
-| `run check -t "Title" --from 50 --auto` | Download from chapter 50 |
+| `run check -t "Title" --from 1 --download --safe` | Download from chapter 1 |
+| `run check -t "Title" --from 50 --download` | Download from chapter 50 |
 | `run check --format epub` | Override output format |
-| `run check --dry-run` | List new chapters without downloading |
+| `run check --dry-run` | Check only: list new chapters, download and save nothing |
 | `run set "Title" reading` | Set status to reading |
 | `run set "Title" on-hold` | Set status to on-hold |
 | `run set "Title" dropped` | Set status to dropped |
@@ -1222,11 +1246,14 @@ cron jobs can rely on these exit codes:
 
 | Code | Meaning |
 |------|---------|
-| `0` | Success |
-| `1` | Error: manga not found, invalid input, refused or failed command, or `check` could not check any manga |
+| `0` | Success. For `check`: no new chapters, a `--dry-run` listing, every chapter downloaded, or a suspicious batch withheld (the warning goes to stderr) |
+| `1` | Error: manga not found, invalid input, refused or failed command, `check` could not check any manga, or `check` skipped chapters that needed confirmation (no terminal, or `--quiet`, without `--download`) |
 | `2` | Invalid command-line usage |
 | `3` | `check` or `failed --retry` ran, but some chapters (or some manga's source checks) failed |
 | `130` | Interrupted with Ctrl-C |
+
+When `check` both skips unconfirmed chapters and has failures, it exits
+`1`.
 
 An exact title duplicate (ignoring case) is refused by `add` with exit code
 `1`, including with `--force` or `--yes`. The existing entry is preserved.
