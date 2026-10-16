@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import sys
 import subprocess
 from pathlib import Path
@@ -34,7 +35,7 @@ from .cron import (build_cron_line, build_task_command, managed_lines,
                    source_checkout_root, unmanaged_memanga_lines)
 from . import doctor
 from .state import State, _chapter_number
-from .downloader import check_for_updates, download_chapter, get_supported_sources, DownloaderError, ChapterWithSource, restart_browsers, _find_chapter_on_backup, _get_sources_from_manga
+from .downloader import DEFAULT_FALLBACK_DELAY_DAYS, check_for_updates, download_chapter, get_supported_sources, DownloaderError, ChapterWithSource, restart_browsers, _find_chapter_on_backup, _get_sources_from_manga
 from .scrapers import get_scraper
 from .search import compute_search_sources, probe_chapter_counts, sweep
 from .emailer import send_to_kindle, EmailError
@@ -695,9 +696,59 @@ def cmd_set_status(args):
     )
 
 
-def cmd_update(args):
-    """Update manga details (URL, backup, title)."""
+_HOST_LABEL = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$")
+
+
+def _is_http_url(value: str) -> bool:
+    """True for an http(s) URL with a valid hostname (and port, if any).
+
+    Malformed input such as ``http://[`` makes urlparse raise ValueError;
+    that is reported as "not a URL" rather than a traceback.
+    """
+    import ipaddress
     from urllib.parse import urlparse
+    try:
+        parsed = urlparse(value)
+        host = parsed.hostname
+        parsed.port  # raises ValueError for a non-numeric/out-of-range port
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not host:
+        return False
+    if parsed.netloc.rpartition("@")[2].startswith("["):
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return False
+        return True
+    try:
+        ascii_host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    labels = ascii_host[:-1].split(".") if ascii_host.endswith(".") else ascii_host.split(".")
+    return len(ascii_host) <= 253 and all(_HOST_LABEL.match(label) for label in labels)
+
+
+def _source_from_url(url: str) -> str:
+    """Scraper source key for a validated URL: its canonical hostname.
+
+    Unlike netloc this drops userinfo and port (so credentials never end up
+    in the stored source), strips a trailing dot and a leading ``www.``, and
+    IDNA-encodes the host so get_scraper() can match it.
+    """
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").rstrip(".")
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass
+    host = host.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def cmd_update(args):
+    """Edit a tracked manga's sources, title and per-manga settings (issue #350)."""
+    import copy
 
     manga_list = config.get("manga", [])
 
@@ -710,58 +761,146 @@ def cmd_update(args):
         return _target_error(args.target, candidates)
 
     old_title = found["title"]
+    url = args.url
+    backup = args.backup
+    no_backup = getattr(args, "no_backup", False)
+    title = args.title
+    fallback_days = getattr(args, "fallback_days", None)
+    status = getattr(args, "status", None)
+    mode = getattr(args, "mode", None)
+    kindle = getattr(args, "send_to_kindle", None)
+
+    requested = (url, backup, title, fallback_days, status, mode, kindle)
+    if all(value is None for value in requested) and not no_backup:
+        return _error(
+            "[yellow]No changes specified. Use --url, --backup, --no-backup, "
+            "--fallback-days, --title, --status, --mode or --kindle/--no-kindle.[/yellow]"
+        )
+
+    # Issue #350: validate every requested value before touching config, so
+    # a bad combination never leaves a half-applied edit behind.
+    if url is not None:
+        url = url.strip()
+        if not _is_http_url(url):
+            return _error(f"[red]Error:[/red] --url needs an http(s) URL, got {_esc(repr(url))}")
+    if backup is not None:
+        backup = backup.strip()
+        if not backup:
+            return _error("[red]Error:[/red] --backup needs a URL; use --no-backup to remove the backup")
+        if not _is_http_url(backup):
+            return _error(f"[red]Error:[/red] --backup needs an http(s) URL, got {_esc(repr(backup))}")
+    if title is not None:
+        title = title.strip()
+        if not title:
+            return _error("[red]Error:[/red] --title cannot be empty")
+        for i, m in enumerate(manga_list):
+            if i != found_idx and m["title"].lower() == title.lower():
+                return _error(f"[red]Error:[/red] '{_esc(m['title'])}' already exists; pick another title")
+
+    # Legacy entries keep `source`/`url`; multi-source entries keep a
+    # `sources` list whose items are dicts or bare URL strings.
+    sources = found.get("sources") if "sources" in found else None
+    entry_urls = [s.get("url", "") if isinstance(s, dict) else (s or "") for s in sources or []]
+    current_url = entry_urls[0] if sources is not None and entry_urls else found.get("url", "")
+    backup_count = max(len(entry_urls) - 1, 0)
+    current_backup = entry_urls[1] if backup_count else ""
+
+    if no_backup and fallback_days is not None:
+        return _error(
+            "[red]Error:[/red] --fallback-days cannot be combined with --no-backup "
+            "(removing the backup also removes its fallback delay)"
+        )
+    if fallback_days is not None and backup is None and not backup_count:
+        return _error(
+            f"[red]Error:[/red] '{_esc(old_title)}' has no backup source; "
+            "--fallback-days needs one (add it with --backup URL)"
+        )
+    if backup is not None and url is None and not current_url:
+        return _error(
+            f"[red]Error:[/red] '{_esc(old_title)}' has no primary source; "
+            "set one with --url before adding a backup"
+        )
+
+    edited = copy.deepcopy(found)
     changes = []
 
     # Update URL
-    if args.url:
-        new_source = urlparse(args.url).netloc.replace("www.", "")
-        if "sources" in found:
-            found["sources"][0] = {"url": args.url, "source": new_source}
+    if url is not None and url != current_url:
+        new_source = _source_from_url(url)
+        if "sources" in edited and edited["sources"]:
+            edited["sources"][0] = {"url": url, "source": new_source}
+        elif "sources" in edited:
+            edited["sources"] = [{"url": url, "source": new_source}]
         else:
-            found["source"] = new_source
-            found["url"] = args.url
+            edited["source"] = new_source
+            edited["url"] = url
         changes.append(f"URL → {new_source}")
 
-    # Update backup
-    if args.backup:
-        backup_source = urlparse(args.backup).netloc.replace("www.", "")
-        if "sources" in found:
-            if len(found["sources"]) > 1:
-                found["sources"][1] = {"url": args.backup, "source": backup_source}
+    # Update backup (replaces the first backup; further backups are kept)
+    if backup is not None and backup != current_backup:
+        backup_source = _source_from_url(backup)
+        if "sources" in edited:
+            if len(edited["sources"]) > 1:
+                edited["sources"][1] = {"url": backup, "source": backup_source}
             else:
-                found["sources"].append({"url": args.backup, "source": backup_source})
+                edited["sources"].append({"url": backup, "source": backup_source})
         else:
             # Convert to multi-source format
-            primary_url = found.pop("url", "")
-            primary_source = found.pop("source", "")
-            found["sources"] = [
+            primary_url = edited.pop("url", "")
+            primary_source = edited.pop("source", "")
+            edited["sources"] = [
                 {"url": primary_url, "source": primary_source},
-                {"url": args.backup, "source": backup_source},
+                {"url": backup, "source": backup_source},
             ]
-            found.setdefault("fallback_delay_days", 2)
+            edited.setdefault("fallback_delay_days", 2)
         changes.append(f"Backup → {backup_source}")
 
+    # Remove every backup, and the fallback delay that only applies to
+    # them (same as clearing the backup in the desktop app).
+    if no_backup and backup_count:
+        edited["sources"] = edited["sources"][:1]
+        edited.pop("fallback_delay_days", None)
+        changes.append("Backup removed" if backup_count == 1 else f"Backups removed ({backup_count})")
+    elif no_backup and "fallback_delay_days" in edited:
+        # Primary-only (legacy/imported) entry with a leftover delay: there
+        # is no backup to remove, but the stale delay goes too.
+        edited.pop("fallback_delay_days")
+        changes.append("Stale fallback delay removed")
+
+    if fallback_days is not None and fallback_days != edited.get(
+            "fallback_delay_days", DEFAULT_FALLBACK_DELAY_DAYS):
+        edited["fallback_delay_days"] = fallback_days
+        changes.append(f"Fallback delay → {fallback_days} day{'' if fallback_days == 1 else 's'}")
+
+    if status is not None and status != found.get("status", "reading"):
+        edited["status"] = status
+        changes.append(f"Status → {status}")
+    if mode is not None and mode != (found.get("mode") or "auto"):
+        edited["mode"] = mode
+        changes.append(f"Mode → {mode}")
+    if kindle is not None and kindle != bool(found.get("send_to_kindle", True)):
+        edited["send_to_kindle"] = kindle
+        changes.append(f"Kindle → {'on' if kindle else 'off'}")
+
     # Rename title
-    if args.title:
-        found["title"] = args.title
+    if title is not None and title != old_title:
+        edited["title"] = title
         # Migrate state (download history) to new title
-        manga_state = state.get("manga", {})
-        if old_title in manga_state:
-            manga_state[args.title] = manga_state.pop(old_title)
-            state.set("manga", manga_state)
+        state.rename_manga(old_title, title)
         # Move already-downloaded files so they stay reachable under the
         # new title (folder + filenames are keyed by title).
         from .downloader import rename_manga_downloads
         try:
-            rename_manga_downloads(config.download_dir, old_title, args.title)
+            rename_manga_downloads(config.download_dir, old_title, title)
         except Exception:
             pass
-        changes.append(f"Title → {args.title}")
+        changes.append(f"Title → {title}")
 
     if not changes:
-        return _error("[yellow]No changes specified. Use --url, --backup, or --title.[/yellow]")
+        console.print(f"[dim]No changes: [cyan]{_esc(old_title)}[/cyan] already has those settings.[/dim]")
+        return
 
-    manga_list[found_idx] = found
+    manga_list[found_idx] = edited
     config.set("manga", manga_list)
     config.save()
 
@@ -2442,11 +2581,31 @@ Examples:
     p_remove.set_defaults(func=cmd_remove)
 
     # update
-    p_update = subparsers.add_parser("update", help="Update manga details (URL, backup, title)")
+    # Issue #350: `edit` is an alias; only the fields given are changed.
+    p_update = subparsers.add_parser(
+        "update", aliases=["edit"],
+        help="Edit a manga's sources, title, status, mode, Kindle toggle or fallback delay",
+        description="Change only the fields given; everything else is kept. Output format "
+                    "is global (memanga config, or check --format); there is no per-manga format.",
+    )
     p_update.add_argument("target", help="Manga title, or #N for its number in 'memanga list'")
     p_update.add_argument("-u", "--url", help="New primary source URL")
-    p_update.add_argument("-b", "--backup", help="New backup source URL")
-    p_update.add_argument("-t", "--title", help="Rename manga title")
+    p_update_backup = p_update.add_mutually_exclusive_group()
+    p_update_backup.add_argument("-b", "--backup",
+                                 help="Add a backup source URL, or replace the first backup")
+    p_update_backup.add_argument("--no-backup", action="store_true",
+                                 help="Remove every backup source and its fallback delay")
+    p_update.add_argument("--fallback-days", type=_non_negative_int_arg,
+                          help="Days to wait before using the backup (0 or more); "
+                               "needs a backup source")
+    p_update.add_argument("-t", "--title", help="Rename manga title (moves its history and downloads)")
+    p_update.add_argument("--status", choices=VALID_STATUSES, help="New status (same as 'memanga set')")
+    p_update.add_argument("--mode", choices=["auto", "manual"], help="Desktop-app download mode")
+    p_update_kindle = p_update.add_mutually_exclusive_group()
+    p_update_kindle.add_argument("--kindle", dest="send_to_kindle", action="store_const", const=True,
+                                 help="Turn the desktop app's per-manga Kindle toggle on")
+    p_update_kindle.add_argument("--no-kindle", dest="send_to_kindle", action="store_const", const=False,
+                                 help="Turn the desktop app's per-manga Kindle toggle off")
     p_update.set_defaults(func=cmd_update)
 
     # check
