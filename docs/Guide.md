@@ -890,7 +890,9 @@ manga:
 
 ## Updating Manga Details
 
-Change the URL, backup, or title of a tracked manga.
+Change the sources, title, or per-manga settings of a tracked manga.
+`edit` is an alias for `update`. Only the fields you pass change; everything
+else is kept.
 
 ### Change the primary URL
 
@@ -909,6 +911,52 @@ run update "One Piece" -b "https://mangadex.org/title/uuid-here"
 ```bash
 run update "One Piece" -t "One Piece (Colored)"
 ```
+
+### Remove the backup source
+
+```bash
+run update "One Piece" --no-backup
+```
+
+This removes every backup source and the fallback delay, like clearing the
+backup field in the desktop app. `--backup ""` is rejected instead of
+silently removing it.
+
+### Change the fallback delay
+
+```bash
+run update "One Piece" --fallback-days 0
+run update "One Piece" -b "https://mangadex.org/title/uuid-here" --fallback-days 3
+```
+
+`--fallback-days` takes whole numbers of days, 0 or greater. It needs a
+backup source: the manga must already have one, or you add it with `--backup`
+in the same command. It cannot be combined with `--no-backup`.
+
+### Change status, mode, or the Kindle toggle
+
+```bash
+run update "One Piece" --status on-hold --mode manual --no-kindle
+```
+
+| Flag | Values |
+|------|--------|
+| `--status` | `reading`, `on-hold`, `dropped`, `completed` (same as `set`) |
+| `--mode` | `auto`, `manual` |
+| `--kindle` / `--no-kindle` | per-manga Kindle toggle on or off |
+
+These are the same per-manga settings `add` accepts (see above), with the
+same desktop-app-only effect of `--mode` and the Kindle toggle. Output format
+stays global (`config`, or `check --format`); there is no per-manga format.
+
+### Combining changes
+
+Flags can be combined in one command. Every value is checked before anything
+is saved, so an invalid URL, an empty title, a title that another manga
+already uses, or a conflicting combination (`--backup` with `--no-backup`,
+`--kindle` with `--no-kindle`, `--fallback-days` with `--no-backup` or
+without a backup) leaves `config.yaml` untouched. If every given value already
+matches, nothing is written.
 
 ### You can also update by list number
 
@@ -1053,6 +1101,9 @@ run import memanga_export.json --replace
 | `run update "Title" -u URL` | Change primary source URL |
 | `run update "Title" -b URL` | Change backup source URL |
 | `run update "Title" -t "New Name"` | Rename a manga |
+| `run update "Title" --no-backup` | Remove the backup source |
+| `run update "Title" --fallback-days 3` | Change the backup fallback delay |
+| `run update "Title" --status on-hold --mode manual --no-kindle` | Change status, mode and Kindle setting |
 | `run config` | Configure settings (delivery, email, format) |
 | `run status` | Show overall status and config |
 | `run status --json` | Status and config as JSON, without secrets |

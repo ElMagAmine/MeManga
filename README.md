@@ -285,7 +285,7 @@ For a host cron job, run Compose from the repository directory:
 | `add` | Add a manga; supports `-t TITLE -u URL [-b BACKUP_URL]` or `-i` interactive |
 | `set TITLE STATUS` | `reading` / `on-hold` / `dropped` / `completed` |
 | `remove TITLE` (`rm`) [--yes] [--purge-history] [--keep-files \| --delete-files] | Drop a manga from tracking. History and files are kept unless `--purge-history` / `--delete-files` is given; `--yes` only skips the confirmation |
-| `update TITLE …` | Edit URL, backup source, or rename |
+| `update TITLE …` (`edit`) | Edit URL, backup (`--backup` / `--no-backup`), fallback days, title, status, mode or Kindle toggle; only the given fields change |
 | `check [TITLE] [--from N] [--auto] [--safe]` | Look for new chapters, optionally download them |
 | `failed [--retry] [--clear] [--json]` | List / re-attempt / clear partially-failed downloads |
 | `status [--json]` | Show config dir, download dir, manga count, last check time |

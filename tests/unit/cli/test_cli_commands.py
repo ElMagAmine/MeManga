@@ -382,6 +382,271 @@ class TestUpdateCommand:
         assert "New Title" in titles
 
 
+PRIMARY = "https://mangadex.org/title/a/x"
+BACKUP = "https://mangapill.com/manga/1/x"
+BACKUP2 = "https://weebcentral.com/series/2/x"
+LEGACY = {"title": "Legacy", "source": "mangadex.org", "url": PRIMARY}
+MULTI = {"title": "Multi", "fallback_delay_days": 3,
+         "sources": [{"url": PRIMARY}, {"url": BACKUP}]}
+
+
+class TestUpdatePolicyFields:
+    """Issue #350: `update` / `edit` covers every editable per-manga field."""
+
+    @pytest.fixture
+    def seed(self, config, isolated_home):
+        def _seed(*entries):
+            config.set("manga", [dict(e) for e in entries])
+            config.save()
+            return isolated_home / ".config" / "memanga" / "config.yaml"
+        return _seed
+
+    def _entry(self, config, title):
+        return next(m for m in config.get("manga", []) if m["title"] == title)
+
+    @pytest.mark.parametrize("status", ["on-hold", "dropped", "completed"])
+    def test_status(self, run_cli, config, seed, status):
+        seed(LEGACY)
+        assert run_cli("update", "Legacy", "--status", status) == 0
+        assert self._entry(config, "Legacy")["status"] == status
+
+    def test_mode(self, run_cli, config, seed):
+        seed(LEGACY)
+        assert run_cli("update", "Legacy", "--mode", "manual") == 0
+        assert self._entry(config, "Legacy")["mode"] == "manual"
+        assert run_cli("update", "Legacy", "--mode", "auto") == 0
+        assert self._entry(config, "Legacy")["mode"] == "auto"
+
+    @pytest.mark.parametrize(("start", "flag", "expected"), [
+        (None, "--no-kindle", False), (False, "--kindle", True),
+    ])
+    def test_kindle(self, run_cli, config, seed, start, flag, expected):
+        entry = dict(LEGACY)
+        if start is not None:
+            entry["send_to_kindle"] = start
+        seed(entry)
+        assert run_cli("update", "Legacy", flag) == 0
+        assert self._entry(config, "Legacy")["send_to_kindle"] is expected
+
+    @pytest.mark.parametrize("days", [0, 7])
+    def test_fallback_days_with_existing_backup(self, run_cli, config, seed, days):
+        seed(MULTI)
+        assert run_cli("update", "Multi", "--fallback-days", str(days)) == 0
+        entry = self._entry(config, "Multi")
+        assert entry["fallback_delay_days"] == days
+        assert entry["sources"] == MULTI["sources"]
+
+    def test_backup_and_fallback_days_on_legacy_entry(self, run_cli, config, seed):
+        seed(LEGACY)
+        assert run_cli("update", "Legacy", "--backup", BACKUP, "--fallback-days", "5") == 0
+        entry = self._entry(config, "Legacy")
+        assert entry == {
+            "title": "Legacy",
+            "fallback_delay_days": 5,
+            "sources": [{"url": PRIMARY, "source": "mangadex.org"},
+                        {"url": BACKUP, "source": "mangapill.com"}],
+        }
+
+    def test_backup_alone_keeps_legacy_default_delay(self, run_cli, config, seed):
+        seed(LEGACY)
+        assert run_cli("update", "Legacy", "-b", BACKUP) == 0
+        assert self._entry(config, "Legacy")["fallback_delay_days"] == 2
+
+    def test_backup_appends_to_single_entry_sources(self, run_cli, config, seed):
+        seed({"title": "One", "sources": [{"url": PRIMARY}]})
+        assert run_cli("update", "One", "--backup", BACKUP) == 0
+        assert self._entry(config, "One")["sources"] == [
+            {"url": PRIMARY}, {"url": BACKUP, "source": "mangapill.com"}]
+
+    def test_no_backup_removes_backup_and_delay(self, run_cli, config, seed, capsys):
+        seed(dict(MULTI, status="on-hold", mode="manual", send_to_kindle=False))
+        assert run_cli("update", "Multi", "--no-backup") == 0
+        assert "Backup removed" in capsys.readouterr().out
+        assert self._entry(config, "Multi") == {
+            "title": "Multi", "sources": [{"url": PRIMARY}],
+            "status": "on-hold", "mode": "manual", "send_to_kindle": False,
+        }
+
+    def test_no_backup_removes_every_backup(self, run_cli, config, seed):
+        seed(dict(MULTI, sources=[{"url": PRIMARY}, {"url": BACKUP}, BACKUP2]))
+        assert run_cli("update", "Multi", "--no-backup") == 0
+        assert self._entry(config, "Multi")["sources"] == [{"url": PRIMARY}]
+
+    def test_no_backup_clears_stale_delay_on_primary_only_entry(self, run_cli, config,
+                                                                 seed, capsys):
+        seed(dict(LEGACY, fallback_delay_days=4), {"title": "One", "fallback_delay_days": 1,
+                                                   "sources": [{"url": BACKUP}]})
+        assert run_cli("update", "Legacy", "--no-backup") == 0
+        assert "Stale fallback delay removed" in capsys.readouterr().out
+        assert self._entry(config, "Legacy") == LEGACY
+        assert run_cli("update", "One", "--no-backup") == 0
+        assert self._entry(config, "One") == {"title": "One", "sources": [{"url": BACKUP}]}
+
+    @pytest.mark.parametrize("url", [
+        "http://mangadex.org/title/a/x",
+        "https://www.mangadex.org:8443/title/a/x?x=1#y",
+        "https://user:pw@mangadex.org/title/a/x",
+        "http://localhost:8080/manga",
+        "http://127.0.0.1/manga",
+        "http://[::1]:8080/manga",
+        "https://mangadex.org./title/a/x",
+    ])
+    def test_valid_url_forms_are_accepted(self, run_cli, config, seed, url):
+        seed(LEGACY)
+        assert run_cli("update", "Legacy", "--url", url) == 0
+        assert self._entry(config, "Legacy")["url"] == url
+
+    def test_no_backup_then_list_json(self, run_cli, config, seed, capsys):
+        seed(MULTI)
+        assert run_cli("update", "Multi", "--no-backup") == 0
+        capsys.readouterr()
+        assert run_cli("list", "--json") == 0
+        [item] = json.loads(capsys.readouterr().out)["manga"]
+        assert (item["url"], item["backup_count"]) == (PRIMARY, 0)
+
+    def test_string_sources_are_supported(self, run_cli, config, seed):
+        seed({"title": "Strings", "fallback_delay_days": 1, "sources": [PRIMARY, BACKUP]})
+        assert run_cli("update", "Strings", "--url", "https://mangadex.org/title/b/y",
+                       "--no-backup") == 0
+        assert self._entry(config, "Strings") == {
+            "title": "Strings",
+            "sources": [{"url": "https://mangadex.org/title/b/y", "source": "mangadex.org"}],
+        }
+
+    def test_combined_edit_via_edit_alias(self, run_cli, config, seed, cli_state):
+        seed(MULTI, LEGACY)
+        cli_state.add_downloaded_chapter("Multi", "4")
+        cli_state.save()
+        assert run_cli("edit", "#1", "--url", "https://www.mangadex.org/title/c/z",
+                       "--backup", BACKUP2, "--fallback-days", "1",
+                       "--title", "Renamed", "--status", "completed",
+                       "--mode", "manual", "--no-kindle") == 0
+        assert self._entry(config, "Renamed") == {
+            "title": "Renamed",
+            "fallback_delay_days": 1,
+            "sources": [
+                {"url": "https://www.mangadex.org/title/c/z", "source": "mangadex.org"},
+                {"url": BACKUP2, "source": "weebcentral.com"},
+            ],
+            "status": "completed", "mode": "manual", "send_to_kindle": False,
+        }
+        assert self._entry(config, "Legacy") == LEGACY
+        from memanga.state import State
+        reloaded = State(config_dir=cli_state.state_path.parent)
+        assert reloaded.get_downloaded_chapters("Renamed") == ["4"]
+        assert reloaded.get_downloaded_chapters("Multi") == []
+
+    def test_title_case_only_rename(self, run_cli, config, seed):
+        seed(LEGACY)
+        assert run_cli("update", "Legacy", "--title", "LEGACY") == 0
+        assert [m["title"] for m in config.get("manga", [])] == ["LEGACY"]
+
+    @pytest.mark.parametrize("flags", [
+        ("--status", "reading"),
+        ("--mode", "auto"),
+        ("--kindle",),
+        ("--no-backup",),
+        ("--url", PRIMARY, "--title", "Legacy"),
+    ])
+    def test_matching_values_write_nothing(self, run_cli, seed, capsys, flags):
+        path = seed(LEGACY)
+        before = path.read_bytes()
+        assert run_cli("update", "Legacy", *flags) == 0
+        assert "No changes" in capsys.readouterr().out
+        assert path.read_bytes() == before
+
+    def test_matching_backup_and_delay_write_nothing(self, run_cli, seed):
+        path = seed(MULTI)
+        before = path.read_bytes()
+        assert run_cli("update", "Multi", "-b", BACKUP, "--fallback-days", "3") == 0
+        assert path.read_bytes() == before
+
+    @pytest.mark.parametrize(("target", "flags", "code", "message"), [
+        ("Multi", ("--backup", BACKUP2, "--no-backup"), 2, "not allowed with"),
+        ("Multi", ("--kindle", "--no-kindle"), 2, "not allowed with"),
+        ("Multi", ("--mode", "automatic"), 2, "--mode"),
+        ("Multi", ("--status", "plan"), 2, "--status"),
+        ("Multi", ("--fallback-days", "-1"), 2, "--fallback-days"),
+        ("Multi", ("--fallback-days", "1.5"), 2, "--fallback-days"),
+        ("Multi", ("--no-backup", "--fallback-days", "1"), 1, "cannot be combined"),
+        ("Legacy", ("--fallback-days", "1"), 1, "no backup source"),
+        ("Legacy", ("--mode", "manual", "--fallback-days", "1"), 1, "no backup source"),
+        ("Multi", ("--backup", ""), 1, "--no-backup"),
+        ("Multi", ("--backup", "mangapill.com/x"), 1, "http(s) URL"),
+        ("Multi", ("--url", ""), 1, "http(s) URL"),
+        ("Multi", ("--url", "ftp://mangadex.org/x", "--status", "dropped"), 1, "http(s) URL"),
+        ("Multi", ("--url", "http://["), 1, "http(s) URL"),
+        ("Multi", ("--backup", "https://[::1"), 1, "http(s) URL"),
+        ("Multi", ("--url", "http://[not-an-ip]/x"), 1, "http(s) URL"),
+        ("Multi", ("--url", "https://:443/x"), 1, "http(s) URL"),
+        ("Multi", ("--url", "https://user@/x"), 1, "http(s) URL"),
+        ("Multi", ("--url", "https://mangadex.org:abc/x"), 1, "http(s) URL"),
+        ("Multi", ("--backup", "https://bad host.com/x"), 1, "http(s) URL"),
+        ("Multi", ("--backup", "https://-bad.com/x"), 1, "http(s) URL"),
+        ("Multi", ("--backup", "https://a..b/x"), 1, "http(s) URL"),
+        ("Multi", ("--title", "  "), 1, "cannot be empty"),
+        ("Multi", ("--title", "legacy", "--no-kindle"), 1, "already exists"),
+    ])
+    def test_invalid_input_writes_nothing(self, run_cli, seed, capsys,
+                                          target, flags, code, message):
+        path = seed(MULTI, LEGACY)
+        before = path.read_bytes()
+        assert run_cli("update", target, *flags) == code
+        assert message in capsys.readouterr().err
+        assert path.read_bytes() == before
+
+    def test_backup_without_primary_is_refused(self, run_cli, seed, capsys):
+        path = seed({"title": "Empty", "sources": []})
+        before = path.read_bytes()
+        assert run_cli("update", "Empty", "--backup", BACKUP) == 1
+        assert "no primary source" in capsys.readouterr().err
+        assert path.read_bytes() == before
+
+    def test_url_on_empty_sources_list(self, run_cli, config, seed):
+        seed({"title": "Empty", "sources": []})
+        assert run_cli("update", "Empty", "--url", PRIMARY) == 0
+        assert self._entry(config, "Empty")["sources"] == [
+            {"url": PRIMARY, "source": "mangadex.org"}]
+
+    @pytest.mark.parametrize("url", [
+        "https://user:pw@mangadex.org/title/a/x",
+        "https://mangadex.org:8443/title/a/x",
+        "https://MangaDex.org./title/a/x",
+        "https://www.mangadex.org/title/a/x",
+    ])
+    @pytest.mark.parametrize("flag", ["--url", "--backup"])
+    def test_url_forms_store_canonical_scraper_source(self, run_cli, config, seed,
+                                                      capsys, flag, url):
+        from memanga.downloader import _get_sources_from_manga
+        from memanga.scrapers import get_scraper
+        from memanga.scrapers.mangadex import MangaDexScraper
+
+        seed({"title": "One", "sources": [{"url": BACKUP, "source": "mangapill.com"}]})
+        assert run_cli("update", "One", flag, url) == 0
+        assert "pw" not in capsys.readouterr().out
+        sources = self._entry(config, "One")["sources"]
+        saved = sources[0] if flag == "--url" else sources[1]
+        assert saved == {"url": url, "source": "mangadex.org"}
+        resolved = _get_sources_from_manga(self._entry(config, "One"))
+        assert isinstance(get_scraper(resolved[sources.index(saved)]["source"]),
+                          MangaDexScraper)
+
+    def test_legacy_url_stores_canonical_scraper_source(self, run_cli, config, seed):
+        url = "https://user:pw@mangadex.org:8443/title/a/x"
+        seed(dict(LEGACY, url=BACKUP, source="mangapill.com"))
+        assert run_cli("update", "Legacy", "--url", url) == 0
+        entry = self._entry(config, "Legacy")
+        assert (entry["url"], entry["source"]) == (url, "mangadex.org")
+
+    def test_help_documents_global_format(self, run_cli, capsys):
+        assert run_cli("update", "--help") == 0
+        out = " ".join(capsys.readouterr().out.split())
+        for flag in ("--no-backup", "--fallback-days", "--status", "--mode",
+                     "--kindle", "--no-kindle"):
+            assert flag in out
+        assert "no per-manga format" in out
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # `check` — find new chapters (mocked)
 # ─────────────────────────────────────────────────────────────────────────
