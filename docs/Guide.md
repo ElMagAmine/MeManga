@@ -1131,10 +1131,12 @@ run import memanga_export.json --replace
 | `run config` | Configure settings (delivery, email, format) |
 | `run status` | Show overall status and config |
 | `run status --json` | Status and config as JSON, without secrets |
-| `run failed` | List failed and accepted-partial chapters |
-| `run failed -t "Title"` | Only manga whose title contains the text |
-| `run failed --retry` | Re-attempt every listed chapter |
-| `run failed --clear` | Forget the listed chapters |
+| `run failed` | List failed and accepted-partial chapters (same as `run failed list`) |
+| `run failed list "Title"` | Only one manga (title or `#N`, matched like `check -t`) |
+| `run failed retry` | Download every listed chapter again (`--retry` is an alias) |
+| `run failed retry "Title"` | Retry one manga only |
+| `run failed clear` | Forget every listed chapter (`--clear` is an alias) |
+| `run failed clear "Title"` | Forget one manga's records only |
 | `run failed --json` | Failed and partial chapters as JSON (listing only) |
 | `run sources` | List all supported sources |
 | `run cron install` | Set up daily automatic checks |
@@ -1235,9 +1237,30 @@ chapter number. `title_filter` is the `-t` value or `null`:
 `status` is `failed` or `partial`. If a chapter has both records, it is
 listed once as `failed`. `chapter` is always a string. `attempts` and
 `error` are `null` for partial chapters, and `total_pages` is `null`
-for failed ones. `failed --json` only lists: combining it with
-`--retry` or `--clear` is a usage error (exit code `2`) and changes
-nothing.
+for failed ones. `failed --json` (or `failed list --json`) only lists:
+combining it with `retry`, `clear`, `--retry` or `--clear` is a usage
+error (exit code `2`) and changes nothing.
+
+### Failed chapters
+
+`failed` has three actions, each with an optional target:
+
+| Command | What it does |
+|---------|--------------|
+| `failed [list [TARGET]]` | Lists failed and accepted-partial chapters. Plain `failed` lists every manga; a TARGET goes after `list`. |
+| `failed retry [TARGET]` | Downloads the chapters again the way `check --download` does: the primary source, then the backup source, then (with partial chapters turned on) the best partial copy. Saved chapters are emailed when delivery is email. |
+| `failed clear [TARGET]` | Forgets the records without downloading anything. |
+
+TARGET is a title or `#N` from `run list`, matched like `check -t`: an
+exact title (ignoring case) wins, then a unique part of a title. A target
+that matches nothing, or more than one manga, is an error (exit code `1`)
+and changes nothing. Manga you no longer track can still be targeted by
+title while they have records. Without a target every manga is included.
+`-t TITLE` still works and is the same as TARGET.
+
+`--retry` and `--clear` are kept as aliases of `failed retry` and
+`failed clear`. `failed retry` exits `3` when a chapter still fails or is
+saved as a partial again; its record stays listed.
 
 ### Exit codes
 
@@ -1249,7 +1272,7 @@ cron jobs can rely on these exit codes:
 | `0` | Success. For `check`: no new chapters, a `--dry-run` listing, every chapter downloaded, or a suspicious batch withheld (the warning goes to stderr) |
 | `1` | Error: manga not found, invalid input, refused or failed command, `check` could not check any manga, or `check` skipped chapters that needed confirmation (no terminal, or `--quiet`, without `--download`) |
 | `2` | Invalid command-line usage |
-| `3` | `check` or `failed --retry` ran, but some chapters (or some manga's source checks) failed |
+| `3` | `check` or `failed retry` ran, but some chapters (or some manga's source checks) failed |
 | `130` | Interrupted with Ctrl-C |
 
 When `check` both skips unconfirmed chapters and has failures, it exits

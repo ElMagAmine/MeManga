@@ -2110,6 +2110,303 @@ class TestFailedJson:
         assert cli_state.get_failed_chapters("Berserk")
 
 
+def _disk_state():
+    """State as `run_cli` left it on disk (seed objects don't reload)."""
+    from pathlib import Path
+    from memanga.state import State
+    return State(config_dir=Path.home() / ".config" / "memanga")
+
+
+class TestFailedSubcommands:
+    """Issue #352: `failed list|retry|clear [TARGET]`, targets resolved
+    like `check -t`, retry through the shared chapter pipeline."""
+
+    @pytest.fixture(autouse=True)
+    def wide_console(self, monkeypatch):
+        # Wide enough that table cells and status lines don't wrap the
+        # asserted strings.
+        from rich.console import Console
+        from memanga import cli
+        monkeypatch.setattr(cli, "console", Console(width=250))
+        monkeypatch.setattr(cli, "err_console", Console(width=250, stderr=True))
+
+    @pytest.fixture
+    def tracked(self, config):
+        config.set("manga", [
+            {"title": t, "source": "mangadex.org",
+             "url": f"https://mangadex.org/title/{i}/x", "status": "reading"}
+            for i, t in enumerate(("Berserk", "Vinland Saga"))
+        ])
+        config.save()
+
+    @pytest.fixture
+    def records(self, cli_state, tracked):
+        cli_state.add_failed_chapter("Berserk", "1", "mangadex.org", "timeout")
+        cli_state.add_failed_chapter("Vinland Saga", "10", "mangadex.org", "HTTP 503")
+        cli_state.add_partial_chapter("Vinland Saga", "9", source="mangadex.org",
+                                      failed_pages=[7], total_pages=40)
+        cli_state.save()
+
+    @pytest.fixture
+    def downloads(self, monkeypatch, tmp_path):
+        """Primary scraper lists every chapter; downloads of chapters in
+        `fail` raise. Returns (calls, fail)."""
+        from memanga import cli
+        from memanga.downloader import DownloaderError
+        from memanga.scrapers.base import Chapter
+
+        calls, fail = [], set()
+
+        class FakeScraper:
+            def get_chapters(self, url):
+                return [Chapter(number=n) for n in ("1", "9", "10")]
+
+        def _download(manga, ch, *a, **k):
+            calls.append((manga["title"], ch.number))
+            if ch.number in fail:
+                raise DownloaderError(f"chapter {ch.number} broke")
+            path = tmp_path / f"{manga['title']}-{ch.number}.pdf"
+            path.write_bytes(b"pdf")
+            return path
+
+        monkeypatch.setattr(cli, "get_scraper", lambda source: FakeScraper())
+        monkeypatch.setattr(cli, "download_chapter", _download)
+        monkeypatch.setattr(cli, "_find_chapter_on_backup", lambda *a, **k: None)
+        return calls, fail
+
+    def test_bare_failed_and_list_both_list(self, run_cli, records, capsys):
+        capsys.readouterr()
+        assert run_cli("failed") == 0
+        bare = capsys.readouterr().out
+        assert run_cli("failed", "list") == 0
+        listed = capsys.readouterr().out
+        for out in (bare, listed):
+            assert "Berserk" in out and "Vinland Saga" in out
+        assert _disk_state().get_failed_chapters("Berserk")
+
+    def test_list_json_same_payload_as_legacy(self, run_cli, records, capsys):
+        capsys.readouterr()
+        assert run_cli("failed", "--json") == 0
+        legacy = _stdout_json(capsys)
+        assert run_cli("failed", "list", "--json") == 0
+        assert _stdout_json(capsys) == legacy
+        assert legacy["count"] == 3
+
+    def test_list_target(self, run_cli, records, capsys):
+        capsys.readouterr()
+        assert run_cli("failed", "list", "vinland", "--json") == 0
+        payload = _stdout_json(capsys)
+        assert payload["title_filter"] == "vinland"
+        assert {c["title"] for c in payload["chapters"]} == {"Vinland Saga"}
+
+    def test_list_target_by_list_index(self, run_cli, records, capsys):
+        capsys.readouterr()
+        assert run_cli("failed", "list", "#1", "--json") == 0
+        payload = _stdout_json(capsys)
+        assert [c["title"] for c in payload["chapters"]] == ["Berserk"]
+
+    def test_untracked_records_stay_reachable(self, run_cli, cli_state,
+                                              tracked, capsys):
+        cli_state.add_failed_chapter("Gone Manga", "3", "mangadex.org", "x")
+        cli_state.save()
+        capsys.readouterr()
+        assert run_cli("failed", "list", "gone", "--json") == 0
+        payload = _stdout_json(capsys)
+        assert [c["title"] for c in payload["chapters"]] == ["Gone Manga"]
+
+    @pytest.mark.parametrize("action", ["list", "retry", "clear"])
+    def test_unknown_target_exits_1_and_changes_nothing(
+            self, run_cli, records, downloads, capsys, action):
+        calls, _ = downloads
+        capsys.readouterr()
+        assert run_cli("failed", action, "Nope") == 1
+        captured = capsys.readouterr()
+        assert "Not found" in captured.err
+        assert calls == []
+        assert _disk_state().get_failed_chapters("Berserk")
+        assert _disk_state().get_failed_chapters("Vinland Saga")
+
+    def test_ambiguous_target_exits_1(self, run_cli, config, cli_state, capsys):
+        config.set("manga", [
+            {"title": t, "source": "mangadex.org", "url": "https://mangadex.org/title/a/x"}
+            for t in ("Alpha One", "Alpha Two")
+        ])
+        config.save()
+        cli_state.add_failed_chapter("Alpha One", "1", "mangadex.org", "x")
+        cli_state.add_failed_chapter("Alpha Two", "1", "mangadex.org", "x")
+        cli_state.save()
+        capsys.readouterr()
+        assert run_cli("failed", "clear", "alpha") == 1
+        assert "Ambiguous" in capsys.readouterr().err
+        assert _disk_state().get_failed_chapters("Alpha One")
+        assert _disk_state().get_failed_chapters("Alpha Two")
+
+    def test_clear_target_only_clears_that_manga(self, run_cli, records, capsys):
+        assert run_cli("failed", "clear", "vinland") == 0
+        assert "Cleared failure and partial records for Vinland Saga" in capsys.readouterr().out
+        assert _disk_state().get_failed_chapters("Vinland Saga") == {}
+        assert _disk_state().get_partial_chapter("Vinland Saga", "9") is None
+        assert _disk_state().get_failed_chapters("Berserk")
+
+    def test_clear_without_target_clears_all(self, run_cli, records, capsys):
+        assert run_cli("failed", "clear") == 0
+        assert "Cleared all failure and partial records" in capsys.readouterr().out
+        assert _disk_state().get_failed_chapters("Berserk") == {}
+        assert _disk_state().get_failed_chapters("Vinland Saga") == {}
+        assert _disk_state().get_partial_chapter("Vinland Saga", "9") is None
+
+    def test_legacy_clear_alias_with_title(self, run_cli, records):
+        assert run_cli("failed", "--clear", "-t", "berserk") == 0
+        assert _disk_state().get_failed_chapters("Berserk") == {}
+        assert _disk_state().get_failed_chapters("Vinland Saga")
+
+    def test_retry_target_only_retries_that_manga(self, run_cli, records,
+                                                  downloads, capsys):
+        calls, _ = downloads
+        capsys.readouterr()
+        assert run_cli("failed", "retry", "Berserk") == 0
+        assert calls == [("Berserk", "1")]
+        assert "1/1 chapters recovered" in capsys.readouterr().out
+        assert _disk_state().get_failed_chapters("Berserk") == {}
+        assert _disk_state().is_chapter_downloaded("Berserk", "1")
+        assert _disk_state().get_failed_chapters("Vinland Saga")
+
+    def test_title_option_before_action(self, run_cli, records, downloads):
+        calls, _ = downloads
+        assert run_cli("failed", "-t", "berserk", "retry") == 0
+        assert calls == [("Berserk", "1")]
+
+    def test_retry_still_failing_exits_3(self, run_cli, records, downloads,
+                                         capsys):
+        calls, fail = downloads
+        fail.add("10")
+        capsys.readouterr()
+        assert run_cli("failed", "retry", "vinland") == 3
+        captured = capsys.readouterr()
+        assert sorted(calls) == [("Vinland Saga", "10"), ("Vinland Saga", "9")]
+        assert "1/2 chapters recovered" in captured.out
+        assert "Failed: chapter 10 broke" in captured.err
+        assert _disk_state().get_failed_chapters("Vinland Saga")["10"]["attempts"] == 2
+        assert _disk_state().get_partial_chapter("Vinland Saga", "9") is None
+
+    def test_retry_uses_check_pipeline_for_backup_and_email(
+            self, run_cli, config, cli_state, monkeypatch, tmp_path, capsys):
+        """A backup save is emailed, like in `check`; the old retry loop
+        skipped delivery for backup saves."""
+        from memanga import cli
+        from memanga.downloader import DownloaderError
+        from memanga.scrapers.base import Chapter
+
+        config.set("delivery.mode", "email")
+        config.set("email.kindle_email", "reader@example.com")
+        config.set("email.sender_email", "sender@example.com")
+        config.set("manga", [{
+            "title": "Vinland Saga",
+            "status": "reading",
+            "sources": [
+                {"source": "primary.test", "url": "https://primary.test/vs"},
+                {"source": "backup.test", "url": "https://backup.test/vs"},
+            ],
+        }])
+        config.save()
+        cli_state.add_failed_chapter("Vinland Saga", "71", "primary.test", "timeout")
+        cli_state.save()
+        backup_ch = types.SimpleNamespace(
+            number="71", title="", url="https://backup.test/c/71",
+            source="backup.test", is_backup=True)
+        backup_path = tmp_path / "backup.pdf"
+        backup_path.write_bytes(b"pdf")
+        sent = []
+
+        class FakeScraper:
+            def get_chapters(self, url):
+                return [Chapter(number="71", url="https://primary.test/c/71")]
+
+        def fake_download(manga, chapter, *a, **k):
+            if getattr(chapter, "is_backup", False):
+                return backup_path
+            raise DownloaderError("primary broke")
+
+        monkeypatch.setattr(cli, "get_scraper", lambda source: FakeScraper())
+        monkeypatch.setattr(cli, "_find_chapter_on_backup", lambda *a, **k: backup_ch)
+        monkeypatch.setattr(cli, "download_chapter", fake_download)
+        monkeypatch.setattr(cli, "send_to_kindle",
+                            lambda **kwargs: sent.append(kwargs["pdf_path"]))
+        monkeypatch.setattr(cli, "get_app_password", lambda cfg: "pw")
+
+        assert run_cli("failed", "retry") == 0
+        assert sent == [backup_path]
+        assert _disk_state().is_chapter_downloaded("Vinland Saga", "71")
+        assert _disk_state().get_failed_chapters("Vinland Saga") == {}
+
+    def test_retry_saved_as_partial_again_is_not_recovered(
+            self, run_cli, config, cli_state, monkeypatch, tmp_path, capsys):
+        from memanga import cli
+        from memanga.scrapers.base import Chapter
+
+        config.set("partial_chapters.enabled", True)
+        config.set("partial_chapters.threshold_percent", 10)
+        config.set("manga", [{"title": "Berserk", "source": "mangadex.org",
+                              "url": "https://mangadex.org/title/b/x"}])
+        config.save()
+        cli_state.add_partial_chapter("Berserk", "5", source="mangadex.org",
+                                      failed_pages=[2], total_pages=40)
+        cli_state.save()
+        path = tmp_path / "partial.pdf"
+        path.write_bytes(b"pdf")
+
+        class FakeScraper:
+            def get_chapters(self, url):
+                return [Chapter(number="5")]
+
+        def fake_download(manga, chapter, *a, **k):
+            k["on_partial"]([3], 40)
+            return path
+
+        monkeypatch.setattr(cli, "get_scraper", lambda source: FakeScraper())
+        monkeypatch.setattr(cli, "download_chapter", fake_download)
+        capsys.readouterr()
+
+        assert run_cli("failed", "retry") == 3
+        assert "0/1 chapters recovered" in capsys.readouterr().out
+        assert _disk_state().get_partial_chapter("Berserk", "5")["failed_pages"] == [3]
+
+    @pytest.mark.parametrize("argv", [
+        ("failed", "--json", "retry"),
+        ("failed", "--json", "clear"),
+        ("failed", "--json", "--clear"),
+    ])
+    def test_json_rejected_with_retry_and_clear(self, run_cli, records,
+                                                capsys, argv):
+        capsys.readouterr()
+        assert run_cli(*argv) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "--json cannot be combined" in captured.err
+        assert _disk_state().get_failed_chapters("Berserk")
+
+    @pytest.mark.parametrize("argv", [
+        ("failed", "retry", "--json"),
+        ("failed", "clear", "--json"),
+        ("failed", "--retry", "clear"),
+        ("failed", "--clear", "list"),
+        ("failed", "-t", "berserk", "clear", "vinland"),
+    ])
+    def test_usage_errors_change_nothing(self, run_cli, records, capsys, argv):
+        capsys.readouterr()
+        assert run_cli(*argv) == 2
+        assert capsys.readouterr().out == ""
+        assert _disk_state().get_failed_chapters("Berserk")
+        assert _disk_state().get_failed_chapters("Vinland Saga")
+
+    def test_help_describes_actions(self, run_cli, capsys):
+        assert run_cli("failed", "--help") == 0
+        out = capsys.readouterr().out
+        for text in ("failed retry [TARGET]", "failed clear [TARGET]",
+                     "aliases", "Exit codes"):
+            assert text in out
+
+
 class TestDoctorCommand:
     def test_json_report(self, run_cli, cli_state, capsys):
         assert run_cli("doctor", "--json", "--check", "config", "--check", "state") == 0
@@ -2817,7 +3114,7 @@ class TestCheckExitCodes:
         assert run_cli("failed", "--retry") == 3
         captured = capsys.readouterr()
         assert "0/1 chapters recovered" in captured.out
-        assert "Still failing" in captured.err
+        assert "Failed: chapter 7 broke" in captured.err
 
     def test_failed_retry_manga_missing_from_config_exits_3(
             self, run_cli, config, cli_state, fake_download, capsys):

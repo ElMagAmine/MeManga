@@ -29,8 +29,23 @@ All notable changes are recorded here. Format loosely follows
   check-only (`--dry-run`), download and ask modes and the exit codes,
   including exit 0 for no new chapters and for a withheld suspicious
   batch.
+- #352 `memanga failed` has explicit actions: `failed list`, `failed
+  retry` and `failed clear`, each with an optional TARGET (a title or
+  `#N`). Plain `failed` still lists, and `--retry`/`--clear` keep working
+  as aliases of `retry`/`clear`.
 
 ### Changed
+- #352 `failed` targets (TARGET or `-t`) are matched like `check -t`: `#N`
+  from `memanga list`, an exact title, then a unique part of a title. A
+  target that matches nothing or several manga is now an error (exit 1)
+  and changes nothing; it used to act on every title containing the
+  text, or exit 0 with nothing found.
+- #352 `failed retry` (and `--retry`) downloads through the same chapter
+  steps as `check --download`: it now also emails chapters saved from the
+  backup source, honors delete-after-send, page retries and the
+  partial-chapter settings, and clears backup-delay clocks. A chapter
+  saved as a partial again keeps its record and counts as not recovered
+  (exit 3).
 - #351 `memanga check --quiet` on a terminal without `--download` now
   skips new chapters and exits 1 with a hint, as it already did without a
   terminal. It used to skip them silently and exit 0. `--quiet` never
