@@ -2887,6 +2887,235 @@ class TestCheckExitCodes:
         assert "Interrupted" in err
 
 
+class TestCheckModes:
+    """Check-only, download and ask modes of `check` (#351)."""
+
+    DOWNLOAD_FLAGS = [
+        ["--download"], ["-a"], ["--auto"], ["-y"], ["--yes"],
+        ["--auto", "--yes"], ["--download", "--auto"], ["--auto", "--quiet"],
+    ]
+
+    @pytest.fixture
+    def seeded(self, config, tmp_path):
+        config.set("manga", [
+            {"title": t, "source": "mangadex.org",
+             "url": f"https://mangadex.org/title/{i}/x", "status": "reading"}
+            for i, t in enumerate(("Alpha", "Beta"))
+        ])
+        config.set("delivery.mode", "email")
+        config.set("delivery.download_dir", str(tmp_path / "dl"))
+        config.set("email.kindle_email", "kindle@example.invalid")
+        config.set("email.sender_email", "me@example.invalid")
+        config.save()
+
+    @pytest.fixture
+    def calls(self, monkeypatch, tmp_path):
+        """Stub the check and every side-effecting step; record calls."""
+        from memanga import cli
+        from memanga.scrapers.base import Chapter
+
+        rec = {"download": [], "email": [], "prompt": [], "restart": 0,
+               "check_kwargs": []}
+
+        def _check(manga, state, **k):
+            rec["check_kwargs"].append(k)
+            return [Chapter(number="5"), Chapter(number="6")]
+
+        def _download(manga, ch, *a, **k):
+            rec["download"].append((manga["title"], ch.number))
+            path = tmp_path / f"{manga['title']}-{ch.number}.pdf"
+            path.write_bytes(b"pdf")
+            return path
+
+        def _prompt(*a, **k):
+            rec["prompt"].append(a)
+            return True
+
+        def _restart():
+            rec["restart"] += 1
+
+        monkeypatch.setattr(cli, "check_for_updates", _check)
+        monkeypatch.setattr(cli, "download_chapter", _download)
+        monkeypatch.setattr(cli, "send_to_kindle",
+                            lambda **k: rec["email"].append(k["pdf_path"]))
+        monkeypatch.setattr(cli, "get_app_password", lambda cfg: "x")
+        monkeypatch.setattr(cli, "_find_chapter_on_backup", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "restart_browsers", _restart)
+        monkeypatch.setattr(cli.Confirm, "ask", _prompt)
+        return rec
+
+    @staticmethod
+    def _stdin(monkeypatch, tty):
+        monkeypatch.setattr(sys, "stdin", _TtyInput("") if tty else io.StringIO(""))
+
+    @pytest.fixture
+    def bound_cli(self, isolated_home, monkeypatch):
+        """memanga.cli bound to the isolated config dir, globals restored."""
+        from memanga import cli
+        for name in ("_context", "config", "state"):
+            monkeypatch.setattr(cli, name, getattr(cli, name))
+        cli.use_context(cli.build_context(isolated_home / ".config" / "memanga"))
+        return cli
+
+    @pytest.mark.parametrize("tty", [False, True])
+    @pytest.mark.parametrize("flags", DOWNLOAD_FLAGS)
+    def test_download_flags_download_without_prompting(
+            self, run_cli, seeded, calls, monkeypatch, capsys, flags, tty):
+        self._stdin(monkeypatch, tty)
+        capsys.readouterr()
+        assert run_cli("check", *flags) == 0
+        assert sorted(calls["download"]) == [
+            ("Alpha", "5"), ("Alpha", "6"), ("Beta", "5"), ("Beta", "6")]
+        assert len(calls["email"]) == 4
+        assert calls["prompt"] == []
+        captured = capsys.readouterr()
+        assert "4/4 chapters downloaded" in captured.out
+        assert captured.err == ""
+
+    @pytest.mark.parametrize("tty", [False, True])
+    @pytest.mark.parametrize("flags", [
+        ["--dry-run"], ["-n"], ["--dry-run", "--auto"], ["-n", "--download"],
+        ["-n", "--yes", "--quiet"], ["-n", "-a", "--all", "--safe"],
+        ["-n", "--download", "--from", "1", "--format", "cbz", "--retries", "0"],
+        ["-n", "--force-suspicious"],
+    ])
+    def test_dry_run_wins_and_has_no_side_effects(
+            self, run_cli, seeded, calls, cli_state, isolated_home,
+            monkeypatch, capsys, flags, tty):
+        from memanga.state import State
+
+        cli_state.add_downloaded_chapter("Alpha", "4")
+        cli_state.save()
+        state_path = isolated_home / ".config" / "memanga" / "state.json"
+        on_disk = state_path.read_bytes()
+        self._stdin(monkeypatch, tty)
+        capsys.readouterr()
+
+        assert run_cli("check", *flags) == 0
+
+        assert calls["download"] == calls["email"] == calls["prompt"] == []
+        assert calls["restart"] == 0
+        assert all(k.get("dry_run") is True for k in calls["check_kwargs"])
+        captured = capsys.readouterr()
+        assert captured.out.count("[DRY RUN]") == 4
+        assert "Dry run: 4 chapter(s) available for download" in captured.out
+        assert captured.err == ""
+        # No check is recorded: last_check, history and every other field
+        # are byte-for-byte unchanged.
+        assert state_path.read_bytes() == on_disk
+        reloaded = State(isolated_home / ".config" / "memanga")
+        assert reloaded.get("last_check") is None
+        assert reloaded.get("check_history", []) == []
+
+    def test_download_run_records_history(self, run_cli, seeded, calls,
+                                          isolated_home, monkeypatch):
+        from memanga.state import State
+
+        self._stdin(monkeypatch, False)
+        assert run_cli("check", "--download") == 0
+        assert all("dry_run" not in k for k in calls["check_kwargs"])
+        reloaded = State(isolated_home / ".config" / "memanga")
+        assert reloaded.get("last_check") is not None
+        assert reloaded.get_check_history()[-1]["downloaded"] == 4
+        assert reloaded.get_check_history()[-1]["new_chapters"] == 4
+
+    def test_default_on_terminal_still_prompts(self, run_cli, seeded, calls,
+                                               monkeypatch):
+        self._stdin(monkeypatch, True)
+        assert run_cli("check", "-t", "Alpha") == 0
+        assert len(calls["prompt"]) == 2
+        assert calls["download"] == [("Alpha", "5"), ("Alpha", "6")]
+
+    @pytest.mark.parametrize("tty,flags", [
+        (False, []), (False, ["--quiet"]), (True, ["--quiet"]),
+        (True, ["-q", "--all"]), (False, ["--from", "1"]),
+    ])
+    def test_unconfirmed_never_downloads_and_exits_1(
+            self, run_cli, seeded, calls, isolated_home, monkeypatch, capsys,
+            tty, flags):
+        from memanga.state import State
+
+        self._stdin(monkeypatch, tty)
+        capsys.readouterr()
+        assert run_cli("check", *flags) == 1
+        assert calls["download"] == calls["email"] == calls["prompt"] == []
+        err = capsys.readouterr().err
+        assert "skipped 4 chapter(s) that need confirmation" in err
+        for flag in ("--download", "--auto", "--yes", "--dry-run"):
+            assert flag in err
+        # Unchanged: an unconfirmed run is still a recorded check.
+        history = State(isolated_home / ".config" / "memanga").get_check_history()
+        assert history[-1] == {**history[-1], "new_chapters": 4, "downloaded": 0}
+
+    def test_unconfirmed_wins_over_partial_failure(self, run_cli, config,
+                                                   calls, monkeypatch, capsys):
+        """Documented precedence: needing confirmation exits 1, not 3."""
+        from memanga import cli
+        from memanga.downloader import DownloaderError
+
+        config.set("manga", [
+            {"title": "Alpha", "source": "mangadex.org", "url": "u/a"},
+            {"title": "Beta", "source": "mangadex.org", "url": "u/b"},
+        ])
+        config.save()
+
+        def _check(manga, state, **k):
+            if manga["title"] == "Beta":
+                raise DownloaderError("HTTP 503")
+            from memanga.scrapers.base import Chapter
+            return [Chapter(number="5")]
+        monkeypatch.setattr(cli, "check_for_updates", _check)
+        self._stdin(monkeypatch, False)
+        assert run_cli("check") == 1
+
+    def test_tui_namespace_still_works(self, seeded, calls, bound_cli,
+                                       monkeypatch):
+        """`cmd_tui` passes the pre-#351 attribute names."""
+        import argparse
+        cli = bound_cli
+
+        self._stdin(monkeypatch, False)
+
+        def _tui_args(auto):
+            return argparse.Namespace(
+                title="Alpha", auto=auto, yes=False, quiet=False,
+                from_chapter=None, safe=False, dry_run=False, format=None,
+                retries=3,
+            )
+
+        assert cli.cmd_check(_tui_args(auto=True)) is None
+        assert calls["download"] == [("Alpha", "5"), ("Alpha", "6")]
+        assert cli.cmd_check(_tui_args(auto=False)) == 1
+        assert len(calls["download"]) == 2
+
+    def test_namespace_without_mode_attributes(self, seeded, calls,
+                                               bound_cli, monkeypatch):
+        import argparse
+        cli = bound_cli
+
+        self._stdin(monkeypatch, False)
+        assert cli.cmd_check(argparse.Namespace(title="Alpha")) == 1
+        assert calls["download"] == []
+
+    def test_help_describes_modes(self, run_cli, capsys):
+        assert run_cli("check", "--help") == 0
+        out = " ".join(capsys.readouterr().out.split())
+        assert "--download, -a, --auto, -y, --yes" in out
+        assert "--auto and --yes are aliases" in out
+        assert "check only" in out.lower()
+        assert "wins over --download" in out
+        assert "Never prompt" in out
+        assert "Minimal output" not in out
+        assert "Exit codes: 0 no new chapters" in out
+        assert "suspicious batch withheld" in out
+
+    def test_top_level_example_uses_download(self, run_cli, capsys):
+        run_cli("--help")
+        out = capsys.readouterr().out
+        assert "memanga check --download" in out
+        assert "memanga check --dry-run" in out
+
+
 class TestTargetMatching:
     """Tracked-manga targets resolve to exactly one entry (#237)."""
 
