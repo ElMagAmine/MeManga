@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import sys
 import subprocess
 from pathlib import Path
@@ -34,7 +35,7 @@ from .cron import (build_cron_line, build_task_command, managed_lines,
                    source_checkout_root, unmanaged_memanga_lines)
 from . import doctor
 from .state import State, _chapter_number
-from .downloader import check_for_updates, download_chapter, get_supported_sources, DownloaderError, ChapterWithSource, restart_browsers, _find_chapter_on_backup, _get_sources_from_manga, _configure_mangadex
+from .downloader import DEFAULT_FALLBACK_DELAY_DAYS, check_for_updates, download_chapter, get_supported_sources, DownloaderError, ChapterWithSource, restart_browsers, _find_chapter_on_backup, _get_sources_from_manga, _configure_mangadex
 from .scrapers import get_scraper
 from .search import compute_search_sources, probe_chapter_counts, sweep
 from .emailer import send_to_kindle, EmailError
@@ -48,7 +49,7 @@ err_console = Console(stderr=True)
 EXIT_OK = 0
 EXIT_ERROR = 1          # operational error: not found, invalid input, refused
 EXIT_USAGE = 2          # usage error (raised by argparse itself)
-EXIT_PARTIAL = 3        # check / failed --retry ran but some chapters failed
+EXIT_PARTIAL = 3        # check / failed retry ran but some chapters failed
 EXIT_INTERRUPTED = 130  # Ctrl-C
 
 
@@ -377,8 +378,12 @@ def cmd_add(args):
         # Interactive mode
         console.print("\n[bold green]➕ Add New Manga[/bold green]\n")
         
-        sources = get_supported_sources()
-        console.print(f"[dim]Supported sources:[/dim] {_esc(', '.join(sources))}\n")
+        # Issue #347: hundreds of domains are unreadable here; point at
+        # `sources` instead of dumping them all.
+        console.print(
+            f"[dim]{len(get_supported_sources())} supported sources; "
+            f"run `memanga sources` to see them.[/dim]\n"
+        )
         
         title = Prompt.ask("📖 Manga title")
         if not title:
@@ -415,7 +420,7 @@ def cmd_add(args):
     source_ok = any(source == s or source.endswith("." + s) for s in supported)
     if not source_ok:
         err_console.print(f"[yellow]⚠️  Warning:[/yellow] '{_esc(source)}' might not be supported.")
-        err_console.print(f"[dim]Supported: {_esc(', '.join(supported))}[/dim]")
+        err_console.print("[dim]Run `memanga sources` to see supported sources.[/dim]")
         if not force:
             if not can_prompt:
                 return _non_interactive_error(
@@ -442,6 +447,18 @@ def cmd_add(args):
             "source": source,
             "url": url,
         }
+
+    # Issue #347: policy fields are written only when given, so a plain
+    # `add` keeps the legacy defaults (reading / auto / Kindle on).
+    status = getattr(args, 'status', None)
+    mode = getattr(args, 'mode', None)
+    kindle = getattr(args, 'send_to_kindle', None)
+    if status is not None:
+        manga_entry["status"] = status
+    if mode is not None:
+        manga_entry["mode"] = mode
+    if kindle is not None:
+        manga_entry["send_to_kindle"] = kindle
     
     # Try to fetch cover URL from the manga page
     if source_ok:
@@ -547,8 +564,36 @@ def _target_error(target: str, candidates: list) -> int:
     return EXIT_ERROR
 
 
+def _shares_download_dir(title: str, others) -> bool:
+    """True if another tracked manga writes to the same download folder.
+
+    Sanitizing can map different titles to one folder ("A:B" and "AB"),
+    and case-insensitive filesystems merge "x" and "X" too.
+    """
+    from .downloader import _sanitize_filename
+    name = _sanitize_filename(title).casefold()
+    return any(_sanitize_filename(m.get("title", "")).casefold() == name
+               for m in others)
+
+
 def cmd_remove(args):
-    """Remove a manga from tracking."""
+    """Remove a manga from tracking.
+
+    Issue #349: download history and downloaded files are kept unless
+    explicitly requested. ``--yes`` only answers the removal confirmation;
+    it never implies --purge-history or --delete-files.
+    """
+    from .downloader import (UnsafeDownloadPathError, delete_manga_downloads,
+                             find_manga_downloads)
+
+    # getattr: the TUI builds its own Namespace without these flags.
+    purge_history = (getattr(args, "purge_history", False)
+                     or getattr(args, "purge", False))
+    keep_files = getattr(args, "keep_files", False)
+    delete_files = getattr(args, "delete_files", False)
+    if keep_files and delete_files:
+        return _error("[red]--keep-files and --delete-files are mutually exclusive.[/red]")
+
     manga_list = config.get("manga", [])
 
     if not manga_list:
@@ -564,23 +609,68 @@ def cmd_remove(args):
             f"refusing to remove '{found['title']}' without confirmation; pass --yes"
         )
 
-    if args.yes or Confirm.ask(f"Remove [cyan]{_esc(found['title'])}[/cyan]?"):
-        manga_list.pop(found_idx)
-        config.set("manga", manga_list)
-        config.save()
-        
-        # Download history is only purged on request: --yes confirms the
-        # removal itself, not this extra cleanup (issue #237).
-        purge = getattr(args, "purge", False)
-        if not purge and not args.yes:
-            purge = Confirm.ask("Also remove download history?", default=False)
-        if purge:
-            manga_state = state.get("manga", {})
-            if found["title"] in manga_state:
-                del manga_state[found["title"]]
-                state.set("manga", manga_state)
-        
-        console.print(f"[red]🗑️  Removed:[/red] {_esc(found['title'])}")
+    title = found["title"]
+    others = manga_list[:found_idx] + manga_list[found_idx + 1:]
+
+    # Resolve the file target before anything is written, so an unsafe
+    # --delete-files request leaves config, state and files untouched.
+    files_dir = None
+    if delete_files:
+        if _shares_download_dir(title, others):
+            return _error(
+                f"[red]Refusing to delete files:[/red] another tracked manga "
+                f"uses the same download folder as {_esc(title)}."
+            )
+        try:
+            files_dir = find_manga_downloads(config.download_dir, title)
+        except (UnsafeDownloadPathError, OSError) as e:
+            return _error(f"[red]Refusing to delete files:[/red] {_esc(e)}")
+
+    if not args.yes:
+        prompt = f"Remove [cyan]{_esc(title)}[/cyan]"
+        if files_dir is not None:
+            prompt += f" and delete [yellow]{_esc(files_dir)}[/yellow]"
+        if not Confirm.ask(prompt + "?"):
+            return None
+        # Interactive runs may opt in to extra cleanup; both default to
+        # no and are asked before anything is written (issues #237/#349).
+        if not purge_history:
+            purge_history = Confirm.ask("Also remove download history?", default=False)
+        if not keep_files and not delete_files and not _shares_download_dir(title, others):
+            try:
+                candidate = find_manga_downloads(config.download_dir, title)
+            except (UnsafeDownloadPathError, OSError):
+                candidate = None
+            if candidate is not None and Confirm.ask(
+                    f"Also delete downloaded files in [yellow]{_esc(candidate)}[/yellow]?",
+                    default=False):
+                delete_files, files_dir = True, candidate
+
+    manga_list.pop(found_idx)
+    config.set("manga", manga_list)
+    config.save()
+
+    if purge_history:
+        manga_state = state.get("manga", {})
+        if title in manga_state:
+            del manga_state[title]
+            state.set("manga", manga_state)
+
+    console.print(f"[red]🗑️  Removed:[/red] {_esc(title)}")
+    if purge_history:
+        console.print("[dim]Download history removed.[/dim]")
+
+    if delete_files:
+        try:
+            deleted = delete_manga_downloads(config.download_dir, title)
+        except (UnsafeDownloadPathError, OSError) as e:
+            return _error(
+                f"[red]Removed from tracking, but could not delete its files:[/red] {_esc(e)}"
+            )
+        if deleted is None:
+            console.print("[dim]No downloaded files to delete.[/dim]")
+        else:
+            console.print(f"[dim]Deleted downloaded files: {_esc(deleted)}[/dim]")
 
 
 def cmd_set_status(args):
@@ -618,9 +708,59 @@ def cmd_set_status(args):
     )
 
 
-def cmd_update(args):
-    """Update manga details (URL, backup, title)."""
+_HOST_LABEL = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$")
+
+
+def _is_http_url(value: str) -> bool:
+    """True for an http(s) URL with a valid hostname (and port, if any).
+
+    Malformed input such as ``http://[`` makes urlparse raise ValueError;
+    that is reported as "not a URL" rather than a traceback.
+    """
+    import ipaddress
     from urllib.parse import urlparse
+    try:
+        parsed = urlparse(value)
+        host = parsed.hostname
+        parsed.port  # raises ValueError for a non-numeric/out-of-range port
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not host:
+        return False
+    if parsed.netloc.rpartition("@")[2].startswith("["):
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return False
+        return True
+    try:
+        ascii_host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    labels = ascii_host[:-1].split(".") if ascii_host.endswith(".") else ascii_host.split(".")
+    return len(ascii_host) <= 253 and all(_HOST_LABEL.match(label) for label in labels)
+
+
+def _source_from_url(url: str) -> str:
+    """Scraper source key for a validated URL: its canonical hostname.
+
+    Unlike netloc this drops userinfo and port (so credentials never end up
+    in the stored source), strips a trailing dot and a leading ``www.``, and
+    IDNA-encodes the host so get_scraper() can match it.
+    """
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").rstrip(".")
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass
+    host = host.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def cmd_update(args):
+    """Edit a tracked manga's sources, title and per-manga settings (issue #350)."""
+    import copy
 
     manga_list = config.get("manga", [])
 
@@ -633,58 +773,146 @@ def cmd_update(args):
         return _target_error(args.target, candidates)
 
     old_title = found["title"]
+    url = args.url
+    backup = args.backup
+    no_backup = getattr(args, "no_backup", False)
+    title = args.title
+    fallback_days = getattr(args, "fallback_days", None)
+    status = getattr(args, "status", None)
+    mode = getattr(args, "mode", None)
+    kindle = getattr(args, "send_to_kindle", None)
+
+    requested = (url, backup, title, fallback_days, status, mode, kindle)
+    if all(value is None for value in requested) and not no_backup:
+        return _error(
+            "[yellow]No changes specified. Use --url, --backup, --no-backup, "
+            "--fallback-days, --title, --status, --mode or --kindle/--no-kindle.[/yellow]"
+        )
+
+    # Issue #350: validate every requested value before touching config, so
+    # a bad combination never leaves a half-applied edit behind.
+    if url is not None:
+        url = url.strip()
+        if not _is_http_url(url):
+            return _error(f"[red]Error:[/red] --url needs an http(s) URL, got {_esc(repr(url))}")
+    if backup is not None:
+        backup = backup.strip()
+        if not backup:
+            return _error("[red]Error:[/red] --backup needs a URL; use --no-backup to remove the backup")
+        if not _is_http_url(backup):
+            return _error(f"[red]Error:[/red] --backup needs an http(s) URL, got {_esc(repr(backup))}")
+    if title is not None:
+        title = title.strip()
+        if not title:
+            return _error("[red]Error:[/red] --title cannot be empty")
+        for i, m in enumerate(manga_list):
+            if i != found_idx and m["title"].lower() == title.lower():
+                return _error(f"[red]Error:[/red] '{_esc(m['title'])}' already exists; pick another title")
+
+    # Legacy entries keep `source`/`url`; multi-source entries keep a
+    # `sources` list whose items are dicts or bare URL strings.
+    sources = found.get("sources") if "sources" in found else None
+    entry_urls = [s.get("url", "") if isinstance(s, dict) else (s or "") for s in sources or []]
+    current_url = entry_urls[0] if sources is not None and entry_urls else found.get("url", "")
+    backup_count = max(len(entry_urls) - 1, 0)
+    current_backup = entry_urls[1] if backup_count else ""
+
+    if no_backup and fallback_days is not None:
+        return _error(
+            "[red]Error:[/red] --fallback-days cannot be combined with --no-backup "
+            "(removing the backup also removes its fallback delay)"
+        )
+    if fallback_days is not None and backup is None and not backup_count:
+        return _error(
+            f"[red]Error:[/red] '{_esc(old_title)}' has no backup source; "
+            "--fallback-days needs one (add it with --backup URL)"
+        )
+    if backup is not None and url is None and not current_url:
+        return _error(
+            f"[red]Error:[/red] '{_esc(old_title)}' has no primary source; "
+            "set one with --url before adding a backup"
+        )
+
+    edited = copy.deepcopy(found)
     changes = []
 
     # Update URL
-    if args.url:
-        new_source = urlparse(args.url).netloc.replace("www.", "")
-        if "sources" in found:
-            found["sources"][0] = {"url": args.url, "source": new_source}
+    if url is not None and url != current_url:
+        new_source = _source_from_url(url)
+        if "sources" in edited and edited["sources"]:
+            edited["sources"][0] = {"url": url, "source": new_source}
+        elif "sources" in edited:
+            edited["sources"] = [{"url": url, "source": new_source}]
         else:
-            found["source"] = new_source
-            found["url"] = args.url
+            edited["source"] = new_source
+            edited["url"] = url
         changes.append(f"URL → {new_source}")
 
-    # Update backup
-    if args.backup:
-        backup_source = urlparse(args.backup).netloc.replace("www.", "")
-        if "sources" in found:
-            if len(found["sources"]) > 1:
-                found["sources"][1] = {"url": args.backup, "source": backup_source}
+    # Update backup (replaces the first backup; further backups are kept)
+    if backup is not None and backup != current_backup:
+        backup_source = _source_from_url(backup)
+        if "sources" in edited:
+            if len(edited["sources"]) > 1:
+                edited["sources"][1] = {"url": backup, "source": backup_source}
             else:
-                found["sources"].append({"url": args.backup, "source": backup_source})
+                edited["sources"].append({"url": backup, "source": backup_source})
         else:
             # Convert to multi-source format
-            primary_url = found.pop("url", "")
-            primary_source = found.pop("source", "")
-            found["sources"] = [
+            primary_url = edited.pop("url", "")
+            primary_source = edited.pop("source", "")
+            edited["sources"] = [
                 {"url": primary_url, "source": primary_source},
-                {"url": args.backup, "source": backup_source},
+                {"url": backup, "source": backup_source},
             ]
-            found.setdefault("fallback_delay_days", 2)
+            edited.setdefault("fallback_delay_days", 2)
         changes.append(f"Backup → {backup_source}")
 
+    # Remove every backup, and the fallback delay that only applies to
+    # them (same as clearing the backup in the desktop app).
+    if no_backup and backup_count:
+        edited["sources"] = edited["sources"][:1]
+        edited.pop("fallback_delay_days", None)
+        changes.append("Backup removed" if backup_count == 1 else f"Backups removed ({backup_count})")
+    elif no_backup and "fallback_delay_days" in edited:
+        # Primary-only (legacy/imported) entry with a leftover delay: there
+        # is no backup to remove, but the stale delay goes too.
+        edited.pop("fallback_delay_days")
+        changes.append("Stale fallback delay removed")
+
+    if fallback_days is not None and fallback_days != edited.get(
+            "fallback_delay_days", DEFAULT_FALLBACK_DELAY_DAYS):
+        edited["fallback_delay_days"] = fallback_days
+        changes.append(f"Fallback delay → {fallback_days} day{'' if fallback_days == 1 else 's'}")
+
+    if status is not None and status != found.get("status", "reading"):
+        edited["status"] = status
+        changes.append(f"Status → {status}")
+    if mode is not None and mode != (found.get("mode") or "auto"):
+        edited["mode"] = mode
+        changes.append(f"Mode → {mode}")
+    if kindle is not None and kindle != bool(found.get("send_to_kindle", True)):
+        edited["send_to_kindle"] = kindle
+        changes.append(f"Kindle → {'on' if kindle else 'off'}")
+
     # Rename title
-    if args.title:
-        found["title"] = args.title
+    if title is not None and title != old_title:
+        edited["title"] = title
         # Migrate state (download history) to new title
-        manga_state = state.get("manga", {})
-        if old_title in manga_state:
-            manga_state[args.title] = manga_state.pop(old_title)
-            state.set("manga", manga_state)
+        state.rename_manga(old_title, title)
         # Move already-downloaded files so they stay reachable under the
         # new title (folder + filenames are keyed by title).
         from .downloader import rename_manga_downloads
         try:
-            rename_manga_downloads(config.download_dir, old_title, args.title)
+            rename_manga_downloads(config.download_dir, old_title, title)
         except Exception:
             pass
-        changes.append(f"Title → {args.title}")
+        changes.append(f"Title → {title}")
 
     if not changes:
-        return _error("[yellow]No changes specified. Use --url, --backup, or --title.[/yellow]")
+        console.print(f"[dim]No changes: [cyan]{_esc(old_title)}[/cyan] already has those settings.[/dim]")
+        return
 
-    manga_list[found_idx] = found
+    manga_list[found_idx] = edited
     config.set("manga", manga_list)
     config.save()
 
@@ -693,8 +921,257 @@ def cmd_update(args):
         console.print(f"  {_esc(c)}")
 
 
+def _pipeline_options(output_format=None, max_retries=3,
+                      allow_partial=None, partial_threshold=None):
+    """Download settings shared by `check` and `failed retry` (#352).
+
+    Partial-chapter tolerance (issue #86) comes from config unless the
+    caller overrides it for a single run.
+    """
+    if allow_partial is None:
+        allow_partial = config.partial_enabled
+    if partial_threshold is None:
+        partial_threshold = config.partial_threshold
+    return {
+        "delivery_mode": config.delivery_mode,
+        "download_dir": config.download_dir,
+        "output_format": output_format or config.output_format,
+        "email_cfg": config.get("email", {}),
+        "post_processing": config.get("delivery.post_processing"),
+        "max_retries": max_retries,
+        "allow_partial": allow_partial,
+        "partial_threshold": partial_threshold,
+    }
+
+
+def _download_chapter_pipeline(manga, ch, ch_label, opts) -> bool:
+    """Download one chapter the way `check` does, shared with `failed
+    retry` (#352): primary source, then a complete copy from the backup,
+    then (with partial tolerance) the best partial. Saves are announced,
+    emailed when delivery is email and recorded in state; a chapter that
+    nothing could save is recorded as failed.
+
+    Returns True when the chapter was saved.
+    """
+    title = manga["title"]
+    delivery_mode = opts["delivery_mode"]
+    download_dir = opts["download_dir"]
+    output_format = opts["output_format"]
+    email_cfg = opts["email_cfg"]
+    post_processing = opts["post_processing"]
+    max_retries = opts["max_retries"]
+    allow_partial = opts["allow_partial"]
+    partial_threshold = opts["partial_threshold"]
+
+
+    # Captures partial-download details from download_chapter so
+    # we can surface which pages are missing without parsing the
+    # log line. Reset per attempt.
+    partial_info = {}
+
+    def _capture_partial(failed_pages, total, _info=partial_info):
+        _info["failed_pages"] = failed_pages
+        _info["total"] = total
+
+    def _deliver_email(file_path):
+        """Send to Kindle if configured (skips image folders)."""
+        if not (delivery_mode == "email" and email_cfg.get("kindle_email")):
+            return
+        if file_path.is_dir():
+            console.print("     [dim]📧 Skipped email (image folders cannot be emailed)[/dim]")
+            return
+        console.print("     [dim]📧 Sending to Kindle...[/dim]")
+        try:
+            send_to_kindle(
+                pdf_path=file_path,
+                kindle_email=email_cfg["kindle_email"],
+                sender_email=email_cfg["sender_email"],
+                smtp_server=email_cfg.get("smtp_server", "smtp.gmail.com"),
+                smtp_port=email_cfg.get("smtp_port", 587),
+                app_password=get_app_password(config),
+            )
+            console.print("     [green]📬 Sent to Kindle![/green]")
+            if config.get("delivery.delete_after_send", False):
+                file_path.unlink()
+                console.print("     [dim]🗑️  Deleted local copy[/dim]")
+        except EmailError as email_e:
+            err_console.print(f"     [red]📧 Email failed: {_esc(email_e)}[/red]")
+
+    def _announce_saved(file_path, from_backup, partial, source=None):
+        """Print the save line and, for partials, warn + log which
+        pages are missing so headless runs leave a trail."""
+        label = _esc(f"{file_path.parent.name}/{file_path.name}/" if file_path.is_dir() else file_path.name)
+        src = " from backup" if from_backup else ""
+        if partial:
+            miss = partial.get("failed_pages", [])
+            total = partial.get("total", 0)
+            err_console.print(
+                f"     [yellow]⚠️  Saved partial{src}: {label} — "
+                f"{len(miss)}/{total} page(s) missing (pages {_esc(miss)})[/yellow]"
+            )
+            state.add_notification(
+                "warn",
+                f"'{title}' Chapter {ch.number} saved as partial: "
+                f"{len(miss)}/{total} page(s) missing (pages {miss}).",
+            )
+            state.add_partial_chapter(
+                title,
+                ch.number,
+                source=source or "",
+                failed_pages=miss,
+                total_pages=total,
+                path=str(file_path),
+                from_backup=from_backup,
+            )
+        else:
+            state.clear_partial_chapter(title, ch.number)
+            console.print(f"     [green]✅ Saved{src}: {label}[/green]")
+
+    try:
+        # Show source info if from backup
+        source_info = ""
+        if isinstance(ch, ChapterWithSource) and ch.is_backup:
+            source_info = f" [yellow](from backup: {_esc(ch.source)})[/yellow]"
+
+        console.print(f"     [dim]⬇️  Downloading {ch_label}...{source_info}[/dim]")
+
+        # Only accept a partial straight away when there's no
+        # backup to try first — otherwise we prefer a complete
+        # download from the backup (issue #86 direction).
+        is_from_backup = isinstance(ch, ChapterWithSource) and ch.is_backup
+        has_backup = (not is_from_backup) and len(_get_sources_from_manga(manga)) > 1
+        primary_allow_partial = allow_partial and not has_backup
+
+        partial_info.clear()
+        file_path = download_chapter(
+            manga, ch, download_dir, output_format,
+            state=state,
+            max_retries=max_retries,
+            post_processing=post_processing,
+            allow_partial=primary_allow_partial,
+            partial_threshold=partial_threshold,
+            on_partial=_capture_partial,
+        )
+        _announce_saved(
+            file_path,
+            from_backup=False,
+            partial=dict(partial_info),
+            source=getattr(ch, "source", None) or "unknown",
+        )
+        _deliver_email(file_path)
+
+        # Update state
+        state.add_downloaded_chapter(title, ch.number)
+        state.clear_pending_backup(title, ch.number)
+        state.clear_failed_chapter(title, ch.number)
+        return True
+
+    except DownloaderError as e:
+        ch_source = ch.source if isinstance(ch, ChapterWithSource) else "unknown"
+        is_from_backup = isinstance(ch, ChapterWithSource) and ch.is_backup
+
+        backup_ch = None
+        if not is_from_backup:
+            backup_ch = _find_chapter_on_backup(manga, ch.number, state)
+
+        saved = False
+        backup_e = None
+
+        # 1) Try a complete download from the backup source.
+        if backup_ch:
+            err_console.print(f"     [yellow]⚠️  Primary failed ({_esc(e)}), trying backup ({_esc(backup_ch.source)})...[/yellow]")
+            try:
+                file_path = download_chapter(
+                    manga, backup_ch, download_dir, output_format,
+                    state=state,
+                    max_retries=max_retries,
+                    post_processing=post_processing,
+                )
+                _announce_saved(
+                    file_path,
+                    from_backup=True,
+                    partial=None,
+                    source=getattr(backup_ch, "source", None),
+                )
+                _deliver_email(file_path)
+                state.add_downloaded_chapter(title, ch.number)
+                state.clear_pending_backup(title, ch.number)
+                state.clear_failed_chapter(title, ch.number)
+                saved = True
+            except DownloaderError as be:
+                backup_e = be
+                err_console.print(f"     [red]❌ Backup also failed: {_esc(be)}[/red]")
+
+        # 2) Both sources failed to deliver a complete chapter.
+        #    If partial tolerance is on, salvage the best partial
+        #    (backup first, then primary) within the threshold.
+        if not saved and allow_partial:
+            salvage = []
+            if backup_ch:
+                salvage.append((backup_ch, True))
+            # Skip the primary here if we already tried it with
+            # partial enabled above (no backup case).
+            if not primary_allow_partial:
+                salvage.append((ch, False))
+            for cand, from_backup in salvage:
+                partial_info.clear()
+                try:
+                    file_path = download_chapter(
+                        manga, cand, download_dir, output_format,
+                        state=state,
+                        max_retries=max_retries,
+                        post_processing=post_processing,
+                        allow_partial=True,
+                        partial_threshold=partial_threshold,
+                        on_partial=_capture_partial,
+                    )
+                except DownloaderError:
+                    continue
+                _announce_saved(
+                    file_path,
+                    from_backup=from_backup,
+                    partial=dict(partial_info),
+                    source=getattr(cand, "source", None),
+                )
+                _deliver_email(file_path)
+                state.add_downloaded_chapter(title, ch.number)
+                state.clear_pending_backup(title, ch.number)
+                state.clear_failed_chapter(title, ch.number)
+                saved = True
+                break
+
+        # 3) Nothing worked — record the failure.
+        if not saved:
+            if backup_ch and backup_e is not None:
+                err_console.print(f"     [red]❌ Failed: {_esc(e)}[/red]")
+                state.add_failed_chapter(
+                    title, ch.number,
+                    f"{ch_source}+{backup_ch.source}",
+                    f"Primary: {e}; Backup: {backup_e}",
+                    failed_pages=getattr(e, "failed_pages", None),
+                )
+            else:
+                err_console.print(f"     [red]❌ Failed: {_esc(e)}[/red]")
+                state.add_failed_chapter(
+                    title, ch.number, ch_source, str(e),
+                    failed_pages=getattr(e, "failed_pages", None),
+                )
+            return False
+        return True
+
+
 def cmd_check(args):
-    """Check for new chapters and download."""
+    """Check for new chapters and download them.
+
+    Modes (#351):
+      - ``--dry-run``: check only. Lists what a download run would fetch;
+        never downloads, delivers or changes state. Wins over every
+        download flag.
+      - ``--download`` (aliases ``--auto``/``--yes``): download without
+        prompting.
+      - otherwise: ask per chapter on a terminal. Without a terminal, or
+        with ``--quiet``, nothing is downloaded and the run exits 1.
+    """
     manga_list = config.get("manga", [])
     
     if not manga_list and not args.title:
@@ -712,11 +1189,20 @@ def cmd_check(args):
     if getattr(args, 'all', False):
         from_chapter = 0
     dry_run = getattr(args, 'dry_run', False)
+    # `--auto`/`--yes` are aliases of `--download`; programmatic callers
+    # (the TUI) may still pass the old attribute names.
+    download = (
+        getattr(args, 'download', False)
+        or getattr(args, 'auto', False)
+        or getattr(args, 'yes', False)
+    )
+    # --quiet never prompts; it is not permission to download.
+    can_prompt = _stdin_is_tty() and not getattr(args, 'quiet', False)
 
     console.print(f"[dim]=== {datetime.now().strftime('%Y-%m-%d %H:%M')} ===[/dim]")
 
     if dry_run:
-        console.print(Panel("[bold]🔍 Dry Run — Checking for New Chapters[/bold]", border_style="yellow"))
+        console.print(Panel("[bold]🔍 Dry Run — Check Only (nothing is downloaded or recorded)[/bold]", border_style="yellow"))
     elif from_chapter is not None and from_chapter == 0:
         console.print(Panel("[bold]📥 Downloading All Chapters[/bold]", border_style="green"))
     elif from_chapter is not None:
@@ -733,24 +1219,22 @@ def cmd_check(args):
     total_errored = 0
     # Chapters left undownloaded because no one could confirm them (#258).
     total_unconfirmed = 0
-    interactive = _stdin_is_tty()
-
-    delivery_mode = config.delivery_mode
-    download_dir = config.download_dir
-    output_format = getattr(args, 'format', None) or config.output_format
-    email_cfg = config.get("email", {})
-    post_processing = config.get("delivery.post_processing")
 
     # Partial-chapter tolerance (issue #86). Config is the source of truth;
     # `check` flags can override it for a single run.
-    allow_partial = config.partial_enabled
+    allow_partial = None
     if getattr(args, 'allow_partial', False):
         allow_partial = True
     if getattr(args, 'no_partial', False):
         allow_partial = False
-    partial_threshold = getattr(args, 'partial_threshold', None)
-    if partial_threshold is None:
-        partial_threshold = config.partial_threshold
+    pipeline = _pipeline_options(
+        output_format=getattr(args, 'format', None),
+        max_retries=getattr(args, 'retries', 3),
+        allow_partial=allow_partial,
+        partial_threshold=getattr(args, 'partial_threshold', None),
+    )
+    delivery_mode = pipeline["delivery_mode"]
+    download_dir = pipeline["download_dir"]
 
     for manga in manga_list:
         title = manga["title"]
@@ -766,15 +1250,23 @@ def cmd_check(args):
         
         try:
             force_suspicious = getattr(args, 'force_suspicious', False)
-            new_chapters = check_for_updates(
-                manga, state,
+            check_kwargs = dict(
                 from_chapter=from_chapter,
                 force_suspicious=force_suspicious,
             )
+            report = {}
+            if dry_run:
+                check_kwargs.update(dry_run=True, report=report)
+            new_chapters = check_for_updates(manga, state, **check_kwargs)
 
             # A batch that doesn't fit this manga's history was withheld
-            # because it couldn't be confirmed by a backup source.
-            suspicious = state.get_suspicious_batch(title) if from_chapter is None else None
+            # because it couldn't be confirmed by a backup source. A dry run
+            # records nothing, so report what this preview decided rather
+            # than a persisted record it would have cleared or replaced.
+            if dry_run:
+                suspicious = report.get("withheld")
+            else:
+                suspicious = state.get_suspicious_batch(title) if from_chapter is None else None
             if suspicious:
                 err_console.print(
                     f"  [yellow]└─ Warning: Suspicious chapter batch detected: "
@@ -785,9 +1277,21 @@ def cmd_check(args):
                 for reason in suspicious.get("reasons", []):
                     err_console.print(f"     [dim]- {_esc(reason)}[/dim]")
                 err_console.print(f"     [dim]- {_esc(suspicious.get('backup_status'))}[/dim]")
+                if dry_run:
+                    err_console.print(
+                        "     [yellow]A download run would skip these chapters. Run "
+                        "'memanga check --download --force-suspicious' to accept anyway.[/yellow]"
+                    )
+                else:
+                    err_console.print(
+                        "     [yellow]Skipped auto-delivery. Run "
+                        "'memanga check --force-suspicious' to accept anyway.[/yellow]"
+                    )
+            elif dry_run and report.get("forced"):
                 err_console.print(
-                    "     [yellow]Skipped auto-delivery. Run "
-                    "'memanga check --force-suspicious' to accept anyway.[/yellow]"
+                    f"  [yellow]└─ --force-suspicious: includes {_esc(report['forced'])} "
+                    "chapter(s) from a suspicious batch; a download run with "
+                    "this flag would accept it.[/yellow]"
                 )
 
             if not new_chapters:
@@ -811,223 +1315,28 @@ def cmd_check(args):
                     if isinstance(ch, ChapterWithSource) and ch.is_backup:
                         source_info = f" [yellow](backup: {_esc(ch.source)})[/yellow]"
                     console.print(f"     [dim][DRY RUN][/dim] {ch_label}{source_info}")
-                    total_downloaded += 1
                     continue
 
                 # Download automatically or prompt
-                should_download = args.auto or args.yes
-                if not should_download and not interactive:
-                    # Even --quiet must not hide missing input (#258).
+                should_download = download
+                if not should_download and not can_prompt:
+                    # No one can confirm: no terminal, or --quiet. Never
+                    # download implicitly and never hide it (#258, #351).
                     total_unconfirmed += 1
                     continue
-                if not should_download and not args.quiet:
+                if not should_download:
                     should_download = Confirm.ask(f"     Download {ch_label}?", default=True)
 
                 if not should_download:
                     continue
 
-                max_retries = getattr(args, 'retries', 3)
-
-                # Captures partial-download details from download_chapter so
-                # we can surface which pages are missing without parsing the
-                # log line. Reset per attempt.
-                partial_info = {}
-
-                def _capture_partial(failed_pages, total, _info=partial_info):
-                    _info["failed_pages"] = failed_pages
-                    _info["total"] = total
-
-                def _deliver_email(file_path):
-                    """Send to Kindle if configured (skips image folders)."""
-                    if not (delivery_mode == "email" and email_cfg.get("kindle_email")):
-                        return
-                    if file_path.is_dir():
-                        console.print("     [dim]📧 Skipped email (image folders cannot be emailed)[/dim]")
-                        return
-                    console.print("     [dim]📧 Sending to Kindle...[/dim]")
-                    try:
-                        send_to_kindle(
-                            pdf_path=file_path,
-                            kindle_email=email_cfg["kindle_email"],
-                            sender_email=email_cfg["sender_email"],
-                            smtp_server=email_cfg.get("smtp_server", "smtp.gmail.com"),
-                            smtp_port=email_cfg.get("smtp_port", 587),
-                            app_password=get_app_password(config),
-                        )
-                        console.print("     [green]📬 Sent to Kindle![/green]")
-                        if config.get("delivery.delete_after_send", False):
-                            file_path.unlink()
-                            console.print("     [dim]🗑️  Deleted local copy[/dim]")
-                    except EmailError as email_e:
-                        err_console.print(f"     [red]📧 Email failed: {_esc(email_e)}[/red]")
-
-                def _announce_saved(file_path, from_backup, partial, source=None):
-                    """Print the save line and, for partials, warn + log which
-                    pages are missing so headless runs leave a trail."""
-                    label = _esc(f"{file_path.parent.name}/{file_path.name}/" if file_path.is_dir() else file_path.name)
-                    src = " from backup" if from_backup else ""
-                    if partial:
-                        miss = partial.get("failed_pages", [])
-                        total = partial.get("total", 0)
-                        err_console.print(
-                            f"     [yellow]⚠️  Saved partial{src}: {label} — "
-                            f"{len(miss)}/{total} page(s) missing (pages {_esc(miss)})[/yellow]"
-                        )
-                        state.add_notification(
-                            "warn",
-                            f"'{title}' Chapter {ch.number} saved as partial: "
-                            f"{len(miss)}/{total} page(s) missing (pages {miss}).",
-                        )
-                        state.add_partial_chapter(
-                            title,
-                            ch.number,
-                            source=source or "",
-                            failed_pages=miss,
-                            total_pages=total,
-                            path=str(file_path),
-                            from_backup=from_backup,
-                        )
-                    else:
-                        state.clear_partial_chapter(title, ch.number)
-                        console.print(f"     [green]✅ Saved{src}: {label}[/green]")
-
-                try:
-                    # Show source info if from backup
-                    source_info = ""
-                    if isinstance(ch, ChapterWithSource) and ch.is_backup:
-                        source_info = f" [yellow](from backup: {_esc(ch.source)})[/yellow]"
-
-                    console.print(f"     [dim]⬇️  Downloading {ch_label}...{source_info}[/dim]")
-
-                    # Only accept a partial straight away when there's no
-                    # backup to try first — otherwise we prefer a complete
-                    # download from the backup (issue #86 direction).
-                    is_from_backup = isinstance(ch, ChapterWithSource) and ch.is_backup
-                    has_backup = (not is_from_backup) and len(_get_sources_from_manga(manga)) > 1
-                    primary_allow_partial = allow_partial and not has_backup
-
-                    partial_info.clear()
-                    file_path = download_chapter(
-                        manga, ch, download_dir, output_format,
-                        state=state,
-                        max_retries=max_retries,
-                        post_processing=post_processing,
-                        allow_partial=primary_allow_partial,
-                        partial_threshold=partial_threshold,
-                        on_partial=_capture_partial,
-                    )
-                    _announce_saved(
-                        file_path,
-                        from_backup=False,
-                        partial=dict(partial_info),
-                        source=getattr(ch, "source", None) or "unknown",
-                    )
-                    _deliver_email(file_path)
-
-                    # Update state
-                    state.add_downloaded_chapter(title, ch.number)
-                    state.clear_pending_backup(title, ch.number)
-                    state.clear_failed_chapter(title, ch.number)
+                if _download_chapter_pipeline(manga, ch, ch_label, pipeline):
                     total_downloaded += 1
-
                     # Safe mode: restart browser every 3 chapters to free memory
-                    safe_mode = getattr(args, 'safe', False)
-                    if safe_mode and total_downloaded % 3 == 0:
+                    if getattr(args, 'safe', False) and total_downloaded % 3 == 0:
                         restart_browsers()
-
-                except DownloaderError as e:
-                    ch_source = ch.source if isinstance(ch, ChapterWithSource) else "unknown"
-                    is_from_backup = isinstance(ch, ChapterWithSource) and ch.is_backup
-
-                    backup_ch = None
-                    if not is_from_backup:
-                        backup_ch = _find_chapter_on_backup(manga, ch.number, state)
-
-                    saved = False
-                    backup_e = None
-
-                    # 1) Try a complete download from the backup source.
-                    if backup_ch:
-                        err_console.print(f"     [yellow]⚠️  Primary failed ({_esc(e)}), trying backup ({_esc(backup_ch.source)})...[/yellow]")
-                        try:
-                            file_path = download_chapter(
-                                manga, backup_ch, download_dir, output_format,
-                                state=state,
-                                max_retries=max_retries,
-                                post_processing=post_processing,
-                            )
-                            _announce_saved(
-                                file_path,
-                                from_backup=True,
-                                partial=None,
-                                source=getattr(backup_ch, "source", None),
-                            )
-                            _deliver_email(file_path)
-                            state.add_downloaded_chapter(title, ch.number)
-                            state.clear_pending_backup(title, ch.number)
-                            state.clear_failed_chapter(title, ch.number)
-                            total_downloaded += 1
-                            saved = True
-                        except DownloaderError as be:
-                            backup_e = be
-                            err_console.print(f"     [red]❌ Backup also failed: {_esc(be)}[/red]")
-
-                    # 2) Both sources failed to deliver a complete chapter.
-                    #    If partial tolerance is on, salvage the best partial
-                    #    (backup first, then primary) within the threshold.
-                    if not saved and allow_partial:
-                        salvage = []
-                        if backup_ch:
-                            salvage.append((backup_ch, True))
-                        # Skip the primary here if we already tried it with
-                        # partial enabled above (no backup case).
-                        if not primary_allow_partial:
-                            salvage.append((ch, False))
-                        for cand, from_backup in salvage:
-                            partial_info.clear()
-                            try:
-                                file_path = download_chapter(
-                                    manga, cand, download_dir, output_format,
-                                    state=state,
-                                    max_retries=max_retries,
-                                    post_processing=post_processing,
-                                    allow_partial=True,
-                                    partial_threshold=partial_threshold,
-                                    on_partial=_capture_partial,
-                                )
-                            except DownloaderError:
-                                continue
-                            _announce_saved(
-                                file_path,
-                                from_backup=from_backup,
-                                partial=dict(partial_info),
-                                source=getattr(cand, "source", None),
-                            )
-                            _deliver_email(file_path)
-                            state.add_downloaded_chapter(title, ch.number)
-                            state.clear_pending_backup(title, ch.number)
-                            state.clear_failed_chapter(title, ch.number)
-                            total_downloaded += 1
-                            saved = True
-                            break
-
-                    # 3) Nothing worked — record the failure.
-                    if not saved:
-                        if backup_ch and backup_e is not None:
-                            err_console.print(f"     [red]❌ Failed: {_esc(e)}[/red]")
-                            state.add_failed_chapter(
-                                title, ch.number,
-                                f"{ch_source}+{backup_ch.source}",
-                                f"Primary: {e}; Backup: {backup_e}",
-                                failed_pages=getattr(e, "failed_pages", None),
-                            )
-                        else:
-                            err_console.print(f"     [red]❌ Failed: {_esc(e)}[/red]")
-                            state.add_failed_chapter(
-                                title, ch.number, ch_source, str(e),
-                                failed_pages=getattr(e, "failed_pages", None),
-                            )
-                        total_failed += 1
+                else:
+                    total_failed += 1
 
         except DownloaderError as e:
             err_console.print(f"  [red]└─ Error: {_esc(e)}[/red]")
@@ -1036,8 +1345,10 @@ def cmd_check(args):
             err_console.print(f"  [red]└─ Unexpected error: {_esc(e)}[/red]")
             total_errored += 1
     
-    # Record check history with actual counts
-    state.update_last_check(new_chapters=total_new, downloaded=total_downloaded)
+    # Record check history with actual counts. A dry run is a preview:
+    # it must not count as a check (the GUI auto-check throttles on it).
+    if not dry_run:
+        state.update_last_check(new_chapters=total_new, downloaded=total_downloaded)
 
     # Summary
     console.print()
@@ -1056,7 +1367,8 @@ def cmd_check(args):
     if total_unconfirmed:
         return _non_interactive_error(
             f"skipped {total_unconfirmed} chapter(s) that need confirmation; "
-            "pass --auto or --yes to download without prompting"
+            "pass --download (or its aliases --auto/--yes) to download without "
+            "prompting, or --dry-run to only list them"
         )
     # Issue #239: nothing could be checked is an error; some chapters or
     # manga failing while the rest ran is a partial failure.
@@ -1847,9 +2159,37 @@ def _chapter_order(item):
     return float(number) if number.replace('.', '', 1).isdigit() else 0
 
 
-def _collect_retryable(title_filter=None):
-    """Failed and accepted-partial records, optionally filtered by a
-    case-insensitive title substring.
+def _resolve_failed_target(target):
+    """Resolve a `failed` TARGET with the same rules as `check -t` (#352).
+
+    `#N` picks the Nth entry in `memanga list`. A title also matches manga
+    that are no longer tracked but still have failure or partial records,
+    so those records stay reachable.
+
+    Returns (title, None), or (None, exit code) after reporting the error.
+    """
+    manga_list = config.get("manga", [])
+    stripped = target.strip()
+    if stripped.startswith("#") and _is_ascii_number(stripped[1:]):
+        candidates = manga_list
+    else:
+        tracked = {m["title"].casefold() for m in manga_list}
+        recorded = sorted(
+            set(state.get_all_failed_chapters()) | set(state.get_all_partial_chapters())
+        )
+        candidates = list(manga_list) + [
+            {"title": t} for t in recorded if t.casefold() not in tracked
+        ]
+    found, _, matches = _find_manga(target, candidates)
+    if not found:
+        return None, _target_error(target, matches)
+    return found["title"], None
+
+
+def _collect_retryable(title=None):
+    """Failed and accepted-partial records, optionally only those of one
+    manga (a title resolved by `_resolve_failed_target`, compared
+    case-insensitively).
 
     Returns (all_failed, all_partials, retryable) where `retryable`
     merges both per manga; a failure record wins over a partial one for
@@ -1858,15 +2198,15 @@ def _collect_retryable(title_filter=None):
     all_failed = state.get_all_failed_chapters()
     all_partials = state.get_all_partial_chapters()
 
-    # Filter by title if requested
-    if title_filter:
+    if title:
+        key = title.casefold()
         all_failed = {
             t: chapters for t, chapters in all_failed.items()
-            if title_filter.lower() in t.lower()
+            if t.casefold() == key
         }
         all_partials = {
             t: chapters for t, chapters in all_partials.items()
-            if title_filter.lower() in t.lower()
+            if t.casefold() == key
         }
 
     retryable = {}
@@ -1911,13 +2251,38 @@ def _failed_payload(retryable, title_filter=None) -> Dict[str, Any]:
     }
 
 
+def _failed_action(args) -> str:
+    """`list`, `retry` or `clear`: the subcommand, else the legacy
+    `--clear`/`--retry` alias (`--clear` wins, as it always did)."""
+    action = getattr(args, "failed_action", None)
+    if action:
+        return action
+    if getattr(args, "clear", False):
+        return "clear"
+    if getattr(args, "retry", False):
+        return "retry"
+    return "list"
+
+
 def cmd_failed(args):
-    """List and manage chapters that failed or were accepted as partial."""
-    all_failed, all_partials, retryable = _collect_retryable(args.title)
+    """List, retry or clear chapters that failed or were accepted as partial.
+
+    Actions (#352): `failed [list]`, `failed retry` and `failed clear`, each
+    with an optional TARGET resolved like `check -t`. `--retry` and
+    `--clear` remain aliases of the subcommands.
+    """
+    action = _failed_action(args)
+    target = getattr(args, "target", None) or getattr(args, "title", None)
+    title = None
+    if target:
+        title, error = _resolve_failed_target(target)
+        if error:
+            return error
+    all_failed, all_partials, retryable = _collect_retryable(title)
 
     if getattr(args, "json", False):
-        # --retry/--clear are rejected with --json at parse time.
-        _print_json(_failed_payload(retryable, args.title))
+        # retry/clear are rejected with --json at parse time.
+        _print_json(_failed_payload(retryable, target))
         return
 
     if not retryable:
@@ -1960,24 +2325,24 @@ def cmd_failed(args):
     console.print(table)
     console.print()
 
-    if args.clear:
+    if action == "clear":
         for manga_title, chapters in all_failed.items():
             for chapter_num in list(chapters):
                 state.clear_failed_chapter(manga_title, chapter_num)
         for manga_title, chapters in all_partials.items():
             for chapter_num in list(chapters):
                 state.clear_partial_chapter(manga_title, chapter_num)
-        console.print("[green]✅ Cleared all failure and partial records.[/green]")
+        if title:
+            console.print(f"[green]✅ Cleared failure and partial records for {_esc(title)}.[/green]")
+        else:
+            console.print("[green]✅ Cleared all failure and partial records.[/green]")
         return
 
-    if args.retry:
+    if action == "retry":
         manga_list = config.get("manga", [])
         manga_by_title = {m["title"]: m for m in manga_list}
-        delivery_mode = config.delivery_mode
-        download_dir = config.download_dir
-        output_format = config.output_format
-        email_cfg = config.get("email", {})
-        post_processing = config.get("delivery.post_processing")
+        # Retries go through the same chapter pipeline as `check` (#352).
+        pipeline = _pipeline_options()
         retried = 0
         succeeded = 0
 
@@ -2019,50 +2384,13 @@ def cmd_failed(args):
 
                 console.print(f"  [dim]⬇️  Retrying {_esc(manga_title)} Chapter {_esc(chapter_num)}...[/dim]")
                 retried += 1
-                try:
-                    file_path = download_chapter(manga, ch_obj, download_dir, output_format, state=state, post_processing=post_processing)
-                    is_image_folder = file_path.is_dir()
-                    if is_image_folder:
-                        console.print(f"  [green]✅ Saved: {_esc(f'{file_path.parent.name}/{file_path.name}/')}[/green]")
-                    else:
-                        console.print(f"  [green]✅ Saved: {_esc(file_path.name)}[/green]")
-
-                    if delivery_mode == "email" and email_cfg.get("kindle_email") and not is_image_folder:
-                        try:
-                            send_to_kindle(
-                                pdf_path=file_path,
-                                kindle_email=email_cfg["kindle_email"],
-                                sender_email=email_cfg["sender_email"],
-                                smtp_server=email_cfg.get("smtp_server", "smtp.gmail.com"),
-                                smtp_port=email_cfg.get("smtp_port", 587),
-                                app_password=get_app_password(config),
-                            )
-                            console.print(f"  [green]📬 Sent to Kindle![/green]")
-                        except EmailError as email_e:
-                            err_console.print(f"  [red]📧 Email failed: {_esc(email_e)}[/red]")
-
-                    state.add_downloaded_chapter(manga_title, chapter_num)
-                    state.clear_failed_chapter(manga_title, chapter_num)
-                    state.clear_partial_chapter(manga_title, chapter_num)
+                ch_label = f"Chapter {ch_obj.number}"
+                if ch_obj.title:
+                    ch_label += f": {ch_obj.title}"
+                saved = _download_chapter_pipeline(manga, ch_obj, _esc(ch_label), pipeline)
+                # Saved again as a partial is not a recovery: the record stays.
+                if saved and state.get_partial_chapter(manga_title, chapter_num) is None:
                     succeeded += 1
-                except DownloaderError as retry_e:
-                    # Try backup if available
-                    backup_ch = _find_chapter_on_backup(manga, chapter_num, state)
-                    if backup_ch:
-                        err_console.print(f"  [yellow]⚠️  Primary failed, trying backup ({_esc(backup_ch.source)})...[/yellow]")
-                        try:
-                            file_path = download_chapter(manga, backup_ch, download_dir, output_format, state=state, post_processing=post_processing)
-                            state.add_downloaded_chapter(manga_title, chapter_num)
-                            state.clear_failed_chapter(manga_title, chapter_num)
-                            state.clear_partial_chapter(manga_title, chapter_num)
-                            label = f"{file_path.parent.name}/{file_path.name}/" if file_path.is_dir() else file_path.name
-                            console.print(f"  [green]✅ Saved from backup: {_esc(label)}[/green]")
-                            succeeded += 1
-                            continue
-                        except DownloaderError:
-                            pass
-                    state.add_failed_chapter(manga_title, chapter_num, info.get("source", "?"), str(retry_e))
-                    err_console.print(f"  [red]❌ Still failing: {_esc(retry_e)}[/red]")
 
         console.print()
         console.print(f"[green]📊 Retry summary: {succeeded}/{retried} chapters recovered[/green]")
@@ -2308,7 +2636,8 @@ Examples:
   memanga add -t "Solo Leveling" -u URL # Add manga directly
   memanga search "Blue Lock"            # Find a manga across sources
   memanga check                         # Check for new chapters
-  memanga check --auto                  # Auto-download new chapters
+  memanga check --download              # Download new chapters, no prompts
+  memanga check --dry-run               # Only list new chapters
   memanga doctor                        # Diagnose setup problems
   memanga cron install                  # Set up daily checks
   memanga config                        # Configure settings
@@ -2357,7 +2686,17 @@ Examples:
     p_add.add_argument("-b", "--backup", help="Backup source URL")
     p_add.add_argument("--fallback-days", type=_non_negative_int_arg, default=2,
                        help="Days to wait before using backup (0 or more; default: 2)")
-    p_add.add_argument("-i", "--interactive", action="store_true", help="Interactive mode")
+    p_add.add_argument("--status", choices=VALID_STATUSES,
+                       help="Initial status (default: reading)")
+    p_add.add_argument("--mode", choices=["auto", "manual"],
+                       help="Desktop-app download mode (default: auto)")
+    p_add_kindle = p_add.add_mutually_exclusive_group()
+    p_add_kindle.add_argument("--kindle", dest="send_to_kindle", action="store_const", const=True,
+                              help="Turn the desktop app's per-manga Kindle toggle on (default)")
+    p_add_kindle.add_argument("--no-kindle", dest="send_to_kindle", action="store_const", const=False,
+                              help="Turn the desktop app's per-manga Kindle toggle off")
+    p_add.add_argument("-i", "--interactive", action="store_true",
+                       help="Interactive mode (--status, --mode and --kindle/--no-kindle still apply)")
     p_add.add_argument("-f", "--force", "-y", "--yes", dest="force", action="store_true",
                        help="Add even if the source might be unsupported or a similar title is tracked")
     p_add.set_defaults(func=cmd_add)
@@ -2371,28 +2710,78 @@ Examples:
     # remove
     p_remove = subparsers.add_parser("remove", aliases=["rm"], help="Remove a manga")
     p_remove.add_argument("target", help="Manga title, or #N for its number in 'memanga list'")
-    p_remove.add_argument("-y", "--yes", action="store_true", help="Skip confirmation (keeps download history)")
-    p_remove.add_argument("--purge", action="store_true", help="Also remove its download history")
+    p_remove.add_argument("-y", "--yes", action="store_true",
+                          help="Skip the removal confirmation only (never purges history or deletes files)")
+    # --purge is the pre-#349 spelling, kept as an alias.
+    p_remove.add_argument("--purge-history", "--purge", dest="purge_history", action="store_true",
+                          help="Also remove its download history")
+    files_group = p_remove.add_mutually_exclusive_group()
+    files_group.add_argument("--keep-files", action="store_true",
+                             help="Keep its downloaded files (default; skips the interactive prompt)")
+    files_group.add_argument("--delete-files", action="store_true",
+                             help="Also delete its download folder (<download dir>/<title>)")
     p_remove.set_defaults(func=cmd_remove)
 
     # update
-    p_update = subparsers.add_parser("update", help="Update manga details (URL, backup, title)")
+    # Issue #350: `edit` is an alias; only the fields given are changed.
+    p_update = subparsers.add_parser(
+        "update", aliases=["edit"],
+        help="Edit a manga's sources, title, status, mode, Kindle toggle or fallback delay",
+        description="Change only the fields given; everything else is kept. Output format "
+                    "is global (memanga config, or check --format); there is no per-manga format.",
+    )
     p_update.add_argument("target", help="Manga title, or #N for its number in 'memanga list'")
     p_update.add_argument("-u", "--url", help="New primary source URL")
-    p_update.add_argument("-b", "--backup", help="New backup source URL")
-    p_update.add_argument("-t", "--title", help="Rename manga title")
+    p_update_backup = p_update.add_mutually_exclusive_group()
+    p_update_backup.add_argument("-b", "--backup",
+                                 help="Add a backup source URL, or replace the first backup")
+    p_update_backup.add_argument("--no-backup", action="store_true",
+                                 help="Remove every backup source and its fallback delay")
+    p_update.add_argument("--fallback-days", type=_non_negative_int_arg,
+                          help="Days to wait before using the backup (0 or more); "
+                               "needs a backup source")
+    p_update.add_argument("-t", "--title", help="Rename manga title (moves its history and downloads)")
+    p_update.add_argument("--status", choices=VALID_STATUSES, help="New status (same as 'memanga set')")
+    p_update.add_argument("--mode", choices=["auto", "manual"], help="Desktop-app download mode")
+    p_update_kindle = p_update.add_mutually_exclusive_group()
+    p_update_kindle.add_argument("--kindle", dest="send_to_kindle", action="store_const", const=True,
+                                 help="Turn the desktop app's per-manga Kindle toggle on")
+    p_update_kindle.add_argument("--no-kindle", dest="send_to_kindle", action="store_const", const=False,
+                                 help="Turn the desktop app's per-manga Kindle toggle off")
     p_update.set_defaults(func=cmd_update)
 
     # check
-    p_check = subparsers.add_parser("check", help="Check for new chapters")
+    p_check = subparsers.add_parser(
+        "check",
+        help="Check for new chapters",
+        description=(
+            "Check tracked manga for new chapters.\n\n"
+            "Modes:\n"
+            "  check --dry-run    check only: list what a download run would fetch;\n"
+            "                     never downloads, delivers or changes state\n"
+            "  check --download   download without prompting (--auto and --yes are\n"
+            "                     aliases; scheduled runs use 'check --auto --quiet')\n"
+            "  check              ask per chapter on a terminal; without a terminal,\n"
+            "                     or with --quiet, download nothing and exit 1\n\n"
+            "--dry-run wins over --download. --all and --from choose where to start;\n"
+            "they don't download by themselves.\n\n"
+            "Exit codes: 0 no new chapters, chapters listed or all downloaded, or a\n"
+            "suspicious batch withheld (warning on stderr); 1 every checked manga\n"
+            "failed, the target was not found, or chapters needed confirmation;\n"
+            "2 usage error; 3 some chapters or manga failed; 130 interrupted."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_check.add_argument("-t", "--title", help="Check one manga only (title, or #N from 'memanga list')")
     p_check.add_argument("-f", "--from", dest="from_chapter", type=float, help="Start from chapter N (for fresh downloads)")
-    p_check.add_argument("--all", action="store_true", help="Download all chapters from the beginning")
-    p_check.add_argument("-a", "--auto", action="store_true", help="Auto-download without prompts")
-    p_check.add_argument("-y", "--yes", action="store_true", help="Say yes to all prompts")
-    p_check.add_argument("-q", "--quiet", action="store_true", help="Minimal output (for cron)")
+    p_check.add_argument("--all", action="store_true", help="Start from the first chapter (backfill; skips the suspicious-batch check)")
+    p_check.add_argument("--download", "-a", "--auto", "-y", "--yes", dest="download", action="store_true",
+                         help="Download new chapters without prompting (--auto and --yes are aliases)")
+    p_check.add_argument("-q", "--quiet", action="store_true",
+                         help="Never prompt; without --download, new chapters are skipped and the run exits 1")
     p_check.add_argument("-s", "--safe", action="store_true", help="Safe mode: restart browser every 3 chapters (for bulk downloads)")
-    p_check.add_argument("-n", "--dry-run", action="store_true", help="List new chapters without downloading")
+    p_check.add_argument("-n", "--dry-run", action="store_true",
+                         help="Check only: list what would be downloaded; no downloads or state changes (wins over --download)")
     p_check.add_argument("--force-suspicious", action="store_true", help="Accept a chapter batch even if it was flagged as suspicious")
     p_check.add_argument("--format", choices=["pdf", "epub", "cbz", "zip", "jpg", "png", "webp"], help="Output format (overrides config)")
     p_check.add_argument("--retries", type=int, default=3, metavar="N", help="Retry failed page downloads N times (default: 3, 0 to disable)")
@@ -2465,12 +2854,45 @@ Examples:
     p_import.set_defaults(func=cmd_import)
 
     # failed
-    p_failed = subparsers.add_parser("failed", help="List chapters with download failures")
-    p_failed.add_argument("-t", "--title", help="Filter by manga title")
-    p_failed.add_argument("--retry", action="store_true", help="Attempt to re-download all listed failed chapters")
-    p_failed.add_argument("--clear", action="store_true", help="Clear failure records without retrying")
+    p_failed = subparsers.add_parser(
+        "failed",
+        help="List, retry or clear failed and partial chapter downloads",
+        description=(
+            "List, retry or clear chapters that failed or were saved as partial.\n\n"
+            "Actions:\n"
+            "  failed [list [TARGET]]   list the records (the default)\n"
+            "  failed retry [TARGET]    download the chapters again the way 'check'\n"
+            "                           does: backup source, partial rules, delivery\n"
+            "  failed clear [TARGET]    forget the records without downloading\n\n"
+            "TARGET is a title or '#N' from 'memanga list', matched like 'check -t';\n"
+            "without it every manga is included. '--retry' and '--clear' are kept as\n"
+            "aliases of 'failed retry' and 'failed clear'. '--json' only lists.\n\n"
+            "Exit codes: 0 success; 1 the target was not found or is ambiguous;\n"
+            "2 usage error; 3 retry left some chapters failed or partial."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_failed.add_argument("-t", "--title", help="Only this manga (title, or #N from 'memanga list'); same as TARGET")
+    p_failed.add_argument("--retry", action="store_true", help="Alias of 'failed retry'")
+    p_failed.add_argument("--clear", action="store_true", help="Alias of 'failed clear'")
     p_failed.add_argument("--json", action="store_true", help="Machine-readable JSON output (listing only)")
     p_failed.set_defaults(func=cmd_failed)
+    failed_actions = p_failed.add_subparsers(dest="failed_action", title="actions", metavar="ACTION")
+    for name, help_text in (
+        ("list", "List failed and partial chapters (default)"),
+        ("retry", "Download the listed chapters again"),
+        ("clear", "Forget the listed records without downloading"),
+    ):
+        p_action = failed_actions.add_parser(name, help=help_text, description=help_text + ".")
+        # SUPPRESS keeps these from overwriting the same options given
+        # before the action (`failed -t X retry`).
+        p_action.add_argument("target", nargs="?", default=argparse.SUPPRESS, metavar="TARGET",
+                              help="Title or #N from 'memanga list' (default: every manga)")
+        p_action.add_argument("-t", "--title", default=argparse.SUPPRESS,
+                              help="Same as TARGET")
+        if name == "list":
+            p_action.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                                  help="Machine-readable JSON output")
 
     # doctor (issue #250)
     p_doctor = subparsers.add_parser(
@@ -2497,10 +2919,17 @@ Examples:
     
     args = parser.parse_args()
 
-    # Keep `failed --json` a pure listing contract instead of mixing
-    # retry/clear progress output into machine-readable stdout.
-    if args.command == "failed" and args.json and (args.retry or args.clear):
-        p_failed.error("--json cannot be combined with --retry or --clear")
+    if args.command == "failed":
+        action = getattr(args, "failed_action", None)
+        if action and (args.retry or args.clear):
+            p_failed.error(f"--retry/--clear cannot be combined with the '{action}' action")
+        # Keep `failed --json` a pure listing contract instead of mixing
+        # retry/clear progress output into machine-readable stdout.
+        if args.json and _failed_action(args) != "list":
+            p_failed.error("--json cannot be combined with retry or clear (--retry/--clear)")
+        target = getattr(args, "target", None)
+        if target and args.title and target != args.title:
+            p_failed.error("give the target once: TARGET or -t/--title")
 
     # The GUI builds its own Config/State under the default root.
     if args.gui and args.config_dir:
